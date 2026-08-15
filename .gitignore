@@ -1,0 +1,6 @@
+/target
+Cargo.lock.bak
+**/*.rs.bk
+*.pdb
+.DS_Store
+mcpg-audit.log

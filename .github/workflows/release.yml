@@ -1,0 +1,34 @@
+# Managed by the release pipeline — changes made here are overwritten.
+# Product and plugin repos get a variant of this shim with their tier
+# metadata baked in.
+#
+# Fires on the `v{version}` release tag (derived from the crate's own
+# `[package].version`) and delegates everything to the shared reusable
+# workflow in the org .github repo — verify (build/test/package), the
+# GitHub Release, and (per tier) production artifacts + signing. The tag
+# itself is the publish: consumers reference this crate as
+# `{ git = "…", tag = "v…" }`, not via crates.io.
+#
+# Releases are disabled unless the org variable OSS_RELEASES_PUBLISH is
+# 'true'; without it the run verifies and cuts nothing.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    uses: mcpg-dev/.github/.github/workflows/release.yml@main
+    with:
+      tier: product
+      has_image: true
+    secrets: inherit

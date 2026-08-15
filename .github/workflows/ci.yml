@@ -1,0 +1,87 @@
+# Self-contained CI for this crate: plain cargo, no external tooling.
+#
+# No lockfile ships with the source. If a Cargo.lock is committed in THIS
+# repository the build is locked to it, which is what makes a push
+# reproducible; otherwise cargo resolves fresh and the run reports that it
+# did. Default features only: the release lane is where the shipped feature
+# set is applied.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # One job on purpose: the steps share a checkout, toolchain and cache, and
+  # a crate this size would pay that setup three times over for parallel
+  # jobs. The display name says what actually runs.
+  checks:
+    name: fmt · clippy · build · test · package
+    # Master CI switch: while the org variable OSS_CI_ENABLED is unset
+    # (the private trial), every run skips instantly — no runner
+    # is consumed and nothing executes until the org flips the variable.
+    if: vars.OSS_CI_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    env:
+      # System git for dependency fetches, so the credential configuration
+      # below applies; harmless when fetches are anonymous.
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      SIBLING_FETCH_TOKEN: ${{ secrets.OSS_SIBLING_FETCH_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Dependency access (pre-publication)
+        # Sibling crates are consumed by git reference. Before publication
+        # those repositories are not world-readable, so a provided token
+        # authenticates the fetches; once they are public this secret is
+        # absent and fetches are anonymous.
+        if: env.SIBLING_FETCH_TOKEN != ''
+        run: |
+          git config --global url."https://x-access-token:${SIBLING_FETCH_TOKEN}@github.com/${{ github.repository_owner }}/".insteadOf "https://github.com/${{ github.repository_owner }}/"
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: System build dependencies
+        # Some crates' build graphs need system tooling the runner image
+        # lacks: protoc (proto-compiling dependencies) and the MIT Kerberos
+        # headers (libgssapi-sys). Cheap enough to install everywhere.
+        run: |
+          sudo apt-get install -y -qq protobuf-compiler libkrb5-dev \
+            || { sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler libkrb5-dev; }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build
+        # --all-targets: dev-dependency features join the resolve, which some
+        # libraries require by convention — k8s-openapi-style crates declare
+        # the API-version feature only in dev-dependencies and expect the
+        # consumer to pick one, so a plain `cargo build` has no feature
+        # provider and fails in the version crate's build script.
+        run: |
+          set -euo pipefail
+          if [ -f Cargo.lock ]; then
+            echo "building --locked against the committed lockfile"
+            cargo build --locked --all-targets
+          else
+            echo "::notice::no committed Cargo.lock — resolving fresh, so this build is not reproducible"
+            cargo build --all-targets
+          fi
+      - name: Test
+        run: |
+          set -euo pipefail
+          if [ -f Cargo.lock ]; then cargo test --locked; else cargo test; fi
+      - name: Manifest hygiene
+        # `cargo package` cannot apply here: packaging strips git references
+        # and re-resolves the version pins against crates.io, where sibling
+        # crates deliberately do not exist — this crate is consumed by git
+        # reference. The standalone-parse check below is what packaging
+        # would have validated about the manifest itself.
+        run: cargo metadata --no-deps --format-version 1 > /dev/null
