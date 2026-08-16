@@ -241,7 +241,21 @@ pub async fn run(ctx: Arc<ControllerContext>) -> anyhow::Result<()> {
         let store = gateway_store.clone();
         let store_ready = Arc::clone(&ctx.store_ready);
         tokio::spawn(async move {
-            match store.wait_until_ready().await {
+            // `wait_until_ready` shares one oneshot with the controller's own
+            // applier delay, and that channel keeps only the LAST waker that
+            // polled it. The applier re-polls on every stream event and wins
+            // the race; a bare await here loses its waker and hangs forever
+            // even though the store is ready. Re-polling on a ticker turns
+            // the lost wake-up into at most a one-second delay.
+            let wait = store.wait_until_ready();
+            tokio::pin!(wait);
+            let result = loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(1), &mut wait).await {
+                    Ok(r) => break r,
+                    Err(_elapsed) => continue,
+                }
+            };
+            match result {
                 Ok(()) => {
                     info!("gateway reflector store synced; reconciles released");
                     store_ready.mark_synced();
