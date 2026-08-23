@@ -35,12 +35,25 @@ jobs:
       SIBLING_FETCH_TOKEN: ${{ secrets.OSS_SIBLING_FETCH_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      # Preferred credential: the org App, minted per run (installation
+      # tokens live an hour). The static secret stays the fallback; public
+      # repos define neither and fetches stay anonymous.
+      - name: Mint sibling-fetch token (org App)
+        id: fetch-token
+        if: vars.OPERATOR_GITHUB_APPLICATION_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ vars.OPERATOR_GITHUB_APPLICATION_ID }}
+          private-key: ${{ secrets.OPERATOR_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
       - name: Dependency access (pre-publication)
         # Sibling crates are consumed by git reference. Before publication
         # those repositories are not world-readable, so a provided token
         # authenticates the fetches; once they are public this secret is
         # absent and fetches are anonymous.
-        if: env.SIBLING_FETCH_TOKEN != ''
+        if: steps.fetch-token.outputs.token != '' || env.SIBLING_FETCH_TOKEN != ''
+        env:
+          SIBLING_FETCH_TOKEN: ${{ steps.fetch-token.outputs.token || secrets.OSS_SIBLING_FETCH_TOKEN }}
         run: |
           git config --global url."https://x-access-token:${SIBLING_FETCH_TOKEN}@github.com/${{ github.repository_owner }}/".insteadOf "https://github.com/${{ github.repository_owner }}/"
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
