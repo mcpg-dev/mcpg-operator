@@ -1,7 +1,7 @@
 [package]
 name = "mcpg-operator"
 description = "Kubernetes operator for managing MCPG (Model Context Protocol Gateway) deployments"
-version = "0.1.0-beta.15"
+version = "0.1.0-beta.18"
 edition = "2024"
 license = "BUSL-1.1"
 repository = "https://github.com/mcpg-dev/mcpg-operator"
@@ -29,14 +29,14 @@ default = []
 
 [dependencies]
 # Operator-api: re-exports the CRD types.
-mcpg-operator-api = { git = "https://github.com/mcpg-dev/mcpg-operator-api", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
+mcpg-operator-api = { git = "https://github.com/mcpg-dev/mcpg-operator-api", tag = "v0.1.0-beta.15", version = "=0.1.0-beta.15" }
 
 # Plugin verification + OCI pull. The operator re-uses the
 # gateway's exact verification path so admission-time + load-
 # time checks are byte-equivalent (no shim layer to drift).
 # Default features only — no `wasm` feature pulls wasmtime in.
-mcpg-plugin-host = { git = "https://github.com/mcpg-dev/mcpg-plugin-host", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
-mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
+mcpg-plugin-host = { git = "https://github.com/mcpg-dev/mcpg-plugin-host", tag = "v0.1.0-beta.16", version = "=0.1.0-beta.16" }
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.15", version = "=0.1.0-beta.15" }
 
 # Kubernetes client + controller runtime.
 kube = { version = "3", default-features = false, features = [
@@ -136,7 +136,7 @@ base64 = "0.22"
 # drift like the `plugins` object→array flatten fails in operator CI
 # instead of at a customer's gateway boot. NOT a runtime dependency;
 # the operator binary never links the gateway.
-mcpg = { git = "https://github.com/mcpg-dev/mcpg", tag = "v0.1.0-beta.16", version = "=0.1.0-beta.16" }
+mcpg = { git = "https://github.com/mcpg-dev/mcpg", tag = "v0.1.0-beta.20", version = "=0.1.0-beta.20" }
 
 [lints.rust]
 # The `fleet` cfg stays declared even where the feature itself is absent:
