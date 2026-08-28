@@ -54,9 +54,9 @@ use crate::reconcile::{
 use crate::telemetry::{MetricsRegistry, ReconcileOutcome};
 use crate::templates::{
     HTTPRoute, PluginSecretMount, REVOCATION_LIST_MOUNT_PATH, ResolvedSetEntry, ResolvedSetView,
-    RevocationListMount, append_cloud_default_plugins, build_configmap, build_deployment,
-    build_hpa, build_httproute, build_pdb, build_service, build_service_account,
-    cloud_default_plugin_ids, merge_plugins, owner_ref,
+    RevocationListMount, append_cloud_default_plugins, append_observability_sink_plugins,
+    build_configmap, build_deployment, build_hpa, build_httproute, build_pdb, build_service,
+    build_service_account, cloud_default_plugin_ids, merge_plugins, owner_ref,
 };
 use crate::{FIELD_MANAGER_PREFIX, labels as label_keys};
 
@@ -1823,6 +1823,10 @@ fn apply_cloud_default_plugins(
         return;
     }
     append_cloud_default_plugins(merged_config, &cloud_default_plugin_ids(override_csv));
+    // Selecting a sink does not load it. Same reasoning as the backends
+    // above, and the same image: without the entry the signal is configured
+    // and silently never exported.
+    append_observability_sink_plugins(merged_config);
 }
 
 /// Finalizer-path cleanup for [`reconcile_edge_domains`]: relinquish this CR's

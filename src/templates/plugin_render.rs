@@ -186,6 +186,123 @@ pub fn append_cloud_default_plugins(config: &mut Value, ids: &[String]) {
     }
 }
 
+/// Observability sink plugins the published gateway images bake, paired
+/// with the `class` each descriptor declares.
+///
+/// A sink is selected by plugin id in `observability.<signal>.sinks[].kind`,
+/// but selecting it does not load it: the cdylib still needs a `plugins[]`
+/// entry. Without one the signal is configured, the gateway boots, nothing
+/// objects, and the metrics are simply never exported — visible only as one
+/// WARN at startup.
+const BAKED_SINK_PLUGINS: &[(&str, &str)] = &[
+    ("dev.mcpg.observability.prometheus", "metrics_sink"),
+    ("dev.mcpg.observability.otlp", "telemetry_sink"),
+];
+
+/// Sink ids named by the rendered config, in first-seen order.
+///
+/// Reading this shape is a deliberate exception to the module's
+/// schema-blindness, and it degrades the safe way: if `observability` ever
+/// moves, no sink is recognised, nothing is appended, and the result is
+/// exactly today's behaviour rather than a wrong entry.
+fn configured_sink_kinds(config: &Value) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let Some(obs) = config.get("observability") else {
+        return out;
+    };
+    for signal in ["metrics", "traces", "logs"] {
+        let Some(sinks) = obs
+            .get(signal)
+            .and_then(|s| s.get("sinks"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for kind in sinks
+            .iter()
+            .filter_map(|s| s.get("kind"))
+            .filter_map(Value::as_str)
+        {
+            if seen.insert(kind.to_owned()) {
+                out.push(kind.to_owned());
+            }
+        }
+    }
+    out
+}
+
+/// Give every configured first-party sink the `plugins[]` entry that loads it.
+///
+/// Only ids in [`BAKED_SINK_PLUGINS`] are added. An entry whose `source.path`
+/// names an artifact the image does not carry fails gateway boot, so a
+/// third-party sink stays the config author's responsibility — the operator
+/// cannot know where its cdylib lives.
+pub fn append_observability_sink_plugins(config: &mut Value) {
+    let wanted: Vec<(&str, &str)> = configured_sink_kinds(config)
+        .into_iter()
+        .filter_map(|kind| {
+            BAKED_SINK_PLUGINS
+                .iter()
+                .find(|(id, _)| *id == kind)
+                .copied()
+        })
+        .collect();
+    if wanted.is_empty() {
+        return;
+    }
+    for (id, class) in wanted {
+        // Re-read the taken set each time: a duplicate plugin id registers a
+        // duplicate alias and fails boot, which is worse than the missing
+        // signal this exists to fix.
+        if plugin_ids(config).contains(id) {
+            continue;
+        }
+        push_plugin_entry(
+            config,
+            json!({
+                "id": id,
+                "kind": "native",
+                "class": class,
+                "source": { "path": format!("{CLOUD_PLUGIN_IMAGE_ROOT}/{id}/plugin.so") },
+            }),
+        );
+    }
+}
+
+/// Ids already claimed by an entry, under either key the gateway accepts.
+fn plugin_ids(config: &Value) -> std::collections::HashSet<String> {
+    config
+        .get("plugins")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .flat_map(|e| {
+                    ["id", "ref"]
+                        .iter()
+                        .filter_map(|k| e.get(k).and_then(Value::as_str).map(str::to_owned))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Append one entry, creating `plugins` (and the object itself) if absent.
+fn push_plugin_entry(config: &mut Value, entry: Value) {
+    if !config.is_object() {
+        *config = json!({});
+    }
+    let obj = config.as_object_mut().expect("config is an object here");
+    if !obj.get("plugins").map(Value::is_array).unwrap_or(false) {
+        obj.insert("plugins".into(), Value::Array(Vec::new()));
+    }
+    obj.get_mut("plugins")
+        .and_then(Value::as_array_mut)
+        .expect("plugins is an array here")
+        .push(entry);
+}
+
 /// Render one managed-cloud default entry. Grants come from the
 /// standard-set table; an override-listed id outside the table gets no
 /// grants (the operator cannot know a foreign plugin's requirements).
@@ -839,5 +956,83 @@ mod tests {
         // class allowlist, ref format).
         mcpg::config::validate_plugins(&cfg.plugins)
             .expect("rendered defaults must pass the gateway's plugins[] validator");
+    }
+
+    fn with_metrics_sink(kind: &str) -> Value {
+        json!({
+            "gateway": { "server": { "bind_address": "0.0.0.0:8787" } },
+            "observability": { "metrics": { "sinks": [{ "kind": kind }] } },
+        })
+    }
+
+    /// The whole point: the entry must satisfy the gateway's OWN parser and
+    /// validator, because a shape the operator likes and the gateway rejects
+    /// is the same silent non-export with extra steps.
+    #[test]
+    fn configured_sink_gets_a_loadable_entry() {
+        let mut config = with_metrics_sink("dev.mcpg.observability.prometheus");
+        append_observability_sink_plugins(&mut config);
+        let cfg: mcpg::config::AppConfig =
+            serde_json::from_value(config).expect("sink entry deserialises into AppConfig");
+        let sink = cfg
+            .plugins
+            .iter()
+            .find(|p| p.id == "dev.mcpg.observability.prometheus")
+            .expect("sink plugin entry present");
+        assert_eq!(sink.class, "metrics_sink");
+        assert_eq!(
+            sink.source.path.as_deref(),
+            Some("/usr/local/lib/mcpg/plugins/dev.mcpg.observability.prometheus/plugin.so")
+        );
+        mcpg::config::validate_plugins(&cfg.plugins)
+            .expect("rendered sink entry must pass the gateway's plugins[] validator");
+    }
+
+    /// A duplicate alias fails gateway boot, which is worse than the missing
+    /// signal this function exists to fix.
+    #[test]
+    fn existing_entry_is_not_duplicated() {
+        let mut config = with_metrics_sink("dev.mcpg.observability.prometheus");
+        config["plugins"] = json!([{
+            "id": "dev.mcpg.observability.prometheus",
+            "kind": "native",
+            "class": "metrics_sink",
+            "source": { "path": "/somewhere/else/plugin.so" },
+        }]);
+        append_observability_sink_plugins(&mut config);
+        assert_eq!(config["plugins"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            config["plugins"][0]["source"]["path"], "/somewhere/else/plugin.so",
+            "an author's own entry must win over the default"
+        );
+    }
+
+    /// The image carries no artifact for a third-party sink, and an entry
+    /// whose `source.path` does not resolve fails boot — a worse outcome
+    /// than the un-exported signal.
+    #[test]
+    fn foreign_sink_is_left_alone() {
+        let mut config = with_metrics_sink("com.example.metrics.datadog");
+        append_observability_sink_plugins(&mut config);
+        assert!(config.get("plugins").is_none());
+    }
+
+    #[test]
+    fn no_observability_section_adds_nothing() {
+        let mut config = json!({ "gateway": { "server": { "bind_address": "0.0.0.0:8787" } } });
+        append_observability_sink_plugins(&mut config);
+        assert!(config.get("plugins").is_none());
+    }
+
+    /// Traces select their sink from a different signal block; the entry the
+    /// gateway needs is the same.
+    #[test]
+    fn trace_sinks_are_covered_too() {
+        let mut config = json!({
+            "observability": { "traces": { "sinks": [{ "kind": "dev.mcpg.observability.otlp" }] } },
+        });
+        append_observability_sink_plugins(&mut config);
+        assert_eq!(config["plugins"][0]["id"], "dev.mcpg.observability.otlp");
+        assert_eq!(config["plugins"][0]["class"], "telemetry_sink");
     }
 }
