@@ -71,7 +71,12 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        # The monorepo lints on a PINNED toolchain; this mirror rides floating
+        # stable, so a new stable's new lints would break every mirror at
+        # once with no code change. Allow exactly the lints that have drifted
+        # ahead of the pin; drop each allow when the monorepo toolchain
+        # catches up and the code is fixed at source.
+        run: cargo clippy --all-targets -- -D warnings -A clippy::result-large-err
       - name: Build
         # --all-targets: dev-dependency features join the resolve, which some
         # libraries require by convention — k8s-openapi-style crates declare
