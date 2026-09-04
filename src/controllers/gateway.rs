@@ -533,6 +533,7 @@ async fn reconcile_inner(
     apply_cloud_default_plugins(
         &obj,
         ctx.config.cloud_default_plugins.as_deref(),
+        ctx.config.default_otlp_traces_url.as_deref(),
         &mut merged_config,
     );
     let (cm, config_hash) = build_configmap(&obj, &merged_config);
@@ -547,6 +548,7 @@ async fn reconcile_inner(
             .unwrap_or(&[]),
         plugin_set.as_ref().map(|p| p.resolved_hash.as_str()),
         revocation_list.as_ref().map(|r| &r.mount),
+        &ctx.config.gateway_pod_annotations_map(),
     );
 
     // Step 3: SSA each child.
@@ -1817,12 +1819,23 @@ async fn reconcile_edge_domains(
 fn apply_cloud_default_plugins(
     obj: &MCPGGateway,
     override_csv: Option<&str>,
+    default_otlp_traces_url: Option<&str>,
     merged_config: &mut serde_json::Value,
 ) {
     if obj.spec.cloud.is_none() {
         return;
     }
     append_cloud_default_plugins(merged_config, &cloud_default_plugin_ids(override_csv));
+    // BEFORE the sink pass below: the injected traces block is what makes it
+    // append the otlp plugin's loader entry.
+    if let Some(url) = default_otlp_traces_url {
+        crate::templates::plugin_render::append_default_traces_block(
+            merged_config,
+            url,
+            obj.metadata.name.as_deref().unwrap_or_default(),
+            obj.metadata.namespace.as_deref().unwrap_or_default(),
+        );
+    }
     // Selecting a sink does not load it. Same reasoning as the backends
     // above, and the same image: without the entry the signal is configured
     // and silently never exported.
@@ -1974,7 +1987,7 @@ mod tests {
     fn cloud_cr_gets_default_backend_entries() {
         let gw = gw_cloudness(true);
         let mut cfg = serde_json::json!({});
-        apply_cloud_default_plugins(&gw, None, &mut cfg);
+        apply_cloud_default_plugins(&gw, None, None, &mut cfg);
         let entries = cfg["plugins"].as_array().expect("plugins array rendered");
         assert_eq!(entries.len(), 5);
         assert!(
@@ -1994,7 +2007,7 @@ mod tests {
         let gw = gw_cloudness(false);
         let mut cfg = serde_json::json!({"gateway": {"server": {}}});
         let before = cfg.clone();
-        apply_cloud_default_plugins(&gw, None, &mut cfg);
+        apply_cloud_default_plugins(&gw, None, None, &mut cfg);
         assert_eq!(cfg, before);
     }
 
@@ -2003,14 +2016,14 @@ mod tests {
         let gw = gw_cloudness(true);
         // Explicit empty = disabled.
         let mut cfg = serde_json::json!({});
-        apply_cloud_default_plugins(&gw, Some(""), &mut cfg);
+        apply_cloud_default_plugins(&gw, Some(""), None, &mut cfg);
         assert!(
             cfg.get("plugins").is_none(),
             "explicit empty disables injection"
         );
         // CSV replaces the standard set.
         let mut cfg = serde_json::json!({});
-        apply_cloud_default_plugins(&gw, Some("dev.mcpg.backend.http"), &mut cfg);
+        apply_cloud_default_plugins(&gw, Some("dev.mcpg.backend.http"), None, &mut cfg);
         let entries = cfg["plugins"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["id"], "dev.mcpg.backend.http");
@@ -2034,7 +2047,7 @@ mod tests {
             capability_grants: BTreeMap::new(),
         };
         let mut cfg = merge_plugins(&serde_json::json!({}), Some(&set), None);
-        apply_cloud_default_plugins(&gw, None, &mut cfg);
+        apply_cloud_default_plugins(&gw, None, None, &mut cfg);
         let entries = cfg["plugins"].as_array().unwrap();
         assert_eq!(entries.len(), 6);
         assert_eq!(entries[0]["id"], "dev.mcpg.identity.workload");

@@ -163,6 +163,24 @@ pub struct OperatorConfig {
     #[arg(long, env = "MCPG_OPERATOR_CLOUD_DEFAULT_PLUGINS")]
     pub cloud_default_plugins: Option<String>,
 
+    /// Default OTLP traces destination for CLOUD-provisioned gateways.
+    /// When set, every rendered tenant-gateway config whose author did not
+    /// declare `observability.traces` gets traces enabled through the
+    /// dev.mcpg.observability.otlp sink at this URL (typically an in-cluster
+    /// collector, e.g. http://otel-collector.monitoring.svc:4317). A config
+    /// that declares its own traces block is left untouched. Unset = no
+    /// injection.
+    #[arg(long, env = "MCPG_OPERATOR_DEFAULT_OTLP_TRACES_URL")]
+    pub default_otlp_traces_url: Option<String>,
+
+    /// Extra pod annotations stamped on every rendered gateway pod, as
+    /// comma-separated key=value pairs (e.g.
+    /// "prometheus.io/scrape=true,prometheus.io/port=8080"). A CR's own
+    /// spec.podAnnotations override these on collision; operator-managed
+    /// hash annotations always win last.
+    #[arg(long, env = "MCPG_OPERATOR_GATEWAY_POD_ANNOTATIONS")]
+    pub gateway_pod_annotations: Option<String>,
+
     /// Run this operator as a PULL-MODE cell agent in addition to its normal
     /// controllers.
     ///
@@ -211,6 +229,24 @@ pub enum LogFormat {
 }
 
 impl OperatorConfig {
+    /// The gateway-pod annotation defaults, parsed. Malformed pairs (no `=`)
+    /// are skipped with a warning rather than failing reconciles.
+    pub fn gateway_pod_annotations_map(&self) -> std::collections::BTreeMap<String, String> {
+        let mut out = std::collections::BTreeMap::new();
+        let Some(raw) = self.gateway_pod_annotations.as_deref() else {
+            return out;
+        };
+        for pair in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            match pair.split_once('=') {
+                Some((k, v)) if !k.trim().is_empty() => {
+                    out.insert(k.trim().to_owned(), v.trim().to_owned());
+                }
+                _ => tracing::warn!(pair, "gateway_pod_annotations: skipping malformed pair"),
+            }
+        }
+        out
+    }
+
     /// Parse from CLI args + env vars. Aborts the process on
     /// invalid input (clap's default behaviour).
     pub fn from_args() -> Self {
@@ -228,6 +264,25 @@ impl OperatorConfig {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn gateway_pod_annotations_parse_and_skip_malformed() {
+        let cfg = OperatorConfig::try_parse_from([
+            "mcpg-operator",
+            "--gateway-pod-annotations=prometheus.io/scrape=true, prometheus.io/port=8080 ,broken,=novalue",
+        ])
+        .unwrap();
+        let map = cfg.gateway_pod_annotations_map();
+        assert_eq!(
+            map.get("prometheus.io/scrape").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            map.get("prometheus.io/port").map(String::as_str),
+            Some("8080")
+        );
+        assert_eq!(map.len(), 2, "malformed pairs are skipped: {map:?}");
+    }
 
     #[test]
     fn defaults_sane() {

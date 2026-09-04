@@ -96,6 +96,7 @@ pub fn build_deployment(
     plugin_mounts: &[PluginSecretMount],
     plugin_set_hash: Option<&str>,
     revocation_list: Option<&RevocationListMount>,
+    default_pod_annotations: &BTreeMap<String, String>,
 ) -> Deployment {
     let name = child_name(parent, "gateway");
     let labels = standard_labels(parent);
@@ -140,6 +141,7 @@ pub fn build_deployment(
                     config_hash,
                     plugin_set_hash,
                     revocation_list,
+                    default_pod_annotations,
                 )),
                 spec: Some(build_pod_spec(parent, port, plugin_mounts, revocation_list)),
             },
@@ -155,6 +157,7 @@ fn build_pod_metadata(
     config_hash: &str,
     plugin_set_hash: Option<&str>,
     revocation_list: Option<&RevocationListMount>,
+    default_pod_annotations: &BTreeMap<String, String>,
 ) -> ObjectMeta {
     let mut pod_labels = labels.clone();
     for (k, v) in &parent.spec.pod_labels {
@@ -171,7 +174,9 @@ fn build_pod_metadata(
         pod_labels.insert(k.clone(), v.clone());
     }
 
-    let mut annotations = parent.spec.pod_annotations.clone();
+    // operator-level defaults first, so a CR's own annotations override them
+    let mut annotations = default_pod_annotations.clone();
+    annotations.extend(parent.spec.pod_annotations.clone());
     annotations.insert(CONFIG_HASH_ANNOTATION.to_owned(), config_hash.to_owned());
     if let Some(h) = plugin_set_hash {
         annotations.insert(PLUGIN_SET_HASH_ANNOTATION.to_owned(), h.to_owned());
@@ -588,6 +593,39 @@ mod tests {
         GatewayImage, GatewayResourceRequirements, GatewayService, MCPGGatewaySpec,
     };
 
+    #[test]
+    fn operator_default_annotations_lose_to_cr_and_hashes() {
+        let mut spec = MCPGGatewaySpec::default();
+        spec.pod_annotations
+            .insert("prometheus.io/port".to_owned(), "9999".to_owned());
+        let defaults = std::collections::BTreeMap::from([
+            ("prometheus.io/scrape".to_owned(), "true".to_owned()),
+            ("prometheus.io/port".to_owned(), "8080".to_owned()),
+        ]);
+        let d = build_deployment(&fixture(spec), "hash-1", &[], None, None, &defaults);
+        let ann = d
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .metadata
+            .as_ref()
+            .unwrap()
+            .annotations
+            .clone()
+            .unwrap();
+        assert_eq!(
+            ann.get("prometheus.io/scrape").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            ann.get("prometheus.io/port").map(String::as_str),
+            Some("9999"),
+            "a CR's own annotation overrides the operator default"
+        );
+        assert!(ann.contains_key(super::CONFIG_HASH_ANNOTATION));
+    }
+
     fn fixture(spec: MCPGGatewaySpec) -> MCPGGateway {
         MCPGGateway {
             metadata: ObjectMeta {
@@ -612,6 +650,7 @@ mod tests {
             &[],
             None,
             None,
+            &Default::default(),
         );
         assert_eq!(d.spec.unwrap().replicas, Some(5));
     }
@@ -624,6 +663,7 @@ mod tests {
             &[],
             None,
             None,
+            &Default::default(),
         );
         let template = d.spec.unwrap().template;
         let annotations = template.metadata.unwrap().annotations.unwrap();
@@ -632,7 +672,14 @@ mod tests {
 
     #[test]
     fn pod_template_has_security_context_restricted() {
-        let d = build_deployment(&fixture(MCPGGatewaySpec::default()), "h", &[], None, None);
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec::default()),
+            "h",
+            &[],
+            None,
+            None,
+            &Default::default(),
+        );
         let pod = d.spec.unwrap().template.spec.unwrap();
         let pod_sec = pod.security_context.unwrap();
         assert_eq!(pod_sec.run_as_non_root, Some(true));
@@ -649,7 +696,14 @@ mod tests {
         // k8s injects `<SVC>_SERVICE_HOST/PORT/...` env for every Service in
         // the ns; the gateway Service is `mcpg-<uid>`, so those would be
         // `MCPG_<UID>_*` and collide with the gateway's MCPG_ config prefix.
-        let d = build_deployment(&fixture(MCPGGatewaySpec::default()), "h", &[], None, None);
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec::default()),
+            "h",
+            &[],
+            None,
+            None,
+            &Default::default(),
+        );
         let pod = d.spec.unwrap().template.spec.unwrap();
         assert_eq!(pod.enable_service_links, Some(false));
     }
@@ -660,7 +714,14 @@ mod tests {
         // runtime writes (default local-file audit sink → ./mcpg-audit.log)
         // need a writable working dir. A bare `tini -- mcpg --config` against
         // a read-only rootfs failed at the audit sink before this landed.
-        let d = build_deployment(&fixture(MCPGGatewaySpec::default()), "h", &[], None, None);
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec::default()),
+            "h",
+            &[],
+            None,
+            None,
+            &Default::default(),
+        );
         let pod = d.spec.unwrap().template.spec.unwrap();
         let c = &pod.containers[0];
         assert_eq!(
@@ -692,7 +753,14 @@ mod tests {
 
     #[test]
     fn default_image_pin_used_when_unspecified() {
-        let d = build_deployment(&fixture(MCPGGatewaySpec::default()), "h", &[], None, None);
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec::default()),
+            "h",
+            &[],
+            None,
+            None,
+            &Default::default(),
+        );
         let image = d.spec.unwrap().template.spec.unwrap().containers[0]
             .image
             .clone()
@@ -714,7 +782,14 @@ mod tests {
     fn rendered_default_tracks_the_resolved_default() {
         let repo = default_gateway_image_repository();
         let tag = default_gateway_image_tag();
-        let d = build_deployment(&fixture(MCPGGatewaySpec::default()), "h", &[], None, None);
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec::default()),
+            "h",
+            &[],
+            None,
+            None,
+            &Default::default(),
+        );
         let image = d.spec.unwrap().template.spec.unwrap().containers[0]
             .image
             .clone()
@@ -737,7 +812,14 @@ mod tests {
         {
             return;
         }
-        let d = build_deployment(&fixture(MCPGGatewaySpec::default()), "h", &[], None, None);
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec::default()),
+            "h",
+            &[],
+            None,
+            None,
+            &Default::default(),
+        );
         let image = d.spec.unwrap().template.spec.unwrap().containers[0]
             .image
             .clone()
@@ -766,6 +848,7 @@ mod tests {
             &[],
             None,
             None,
+            &Default::default(),
         );
         let image = d.spec.unwrap().template.spec.unwrap().containers[0]
             .image
@@ -776,7 +859,14 @@ mod tests {
 
     #[test]
     fn default_resources_match_helm_chart() {
-        let d = build_deployment(&fixture(MCPGGatewaySpec::default()), "h", &[], None, None);
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec::default()),
+            "h",
+            &[],
+            None,
+            None,
+            &Default::default(),
+        );
         let res = d.spec.unwrap().template.spec.unwrap().containers[0]
             .resources
             .clone()
@@ -802,6 +892,7 @@ mod tests {
             &[],
             None,
             None,
+            &Default::default(),
         );
         let res = d.spec.unwrap().template.spec.unwrap().containers[0]
             .resources
@@ -813,7 +904,14 @@ mod tests {
 
     #[test]
     fn config_volume_mounts_config_yaml_via_subpath() {
-        let d = build_deployment(&fixture(MCPGGatewaySpec::default()), "h", &[], None, None);
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec::default()),
+            "h",
+            &[],
+            None,
+            None,
+            &Default::default(),
+        );
         let mounts = d.spec.unwrap().template.spec.unwrap().containers[0]
             .volume_mounts
             .clone()
@@ -827,7 +925,14 @@ mod tests {
 
     #[test]
     fn config_volume_references_operator_configmap() {
-        let d = build_deployment(&fixture(MCPGGatewaySpec::default()), "h", &[], None, None);
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec::default()),
+            "h",
+            &[],
+            None,
+            None,
+            &Default::default(),
+        );
         let volumes = d.spec.unwrap().template.spec.unwrap().volumes.unwrap();
         let cm_vol = volumes.iter().find(|v| v.name == "config").unwrap();
         let cm_src = cm_vol.config_map.as_ref().unwrap();
@@ -836,7 +941,14 @@ mod tests {
 
     #[test]
     fn liveness_and_readiness_probes_use_default_paths() {
-        let d = build_deployment(&fixture(MCPGGatewaySpec::default()), "h", &[], None, None);
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec::default()),
+            "h",
+            &[],
+            None,
+            None,
+            &Default::default(),
+        );
         let container = &d.spec.unwrap().template.spec.unwrap().containers[0];
         let liveness = container.liveness_probe.as_ref().unwrap();
         let readiness = container.readiness_probe.as_ref().unwrap();
@@ -865,6 +977,7 @@ mod tests {
             &[],
             None,
             None,
+            &Default::default(),
         );
         let pod_labels = d.spec.unwrap().template.metadata.unwrap().labels.unwrap();
         // Operator-managed key wins.
@@ -878,7 +991,14 @@ mod tests {
 
     #[test]
     fn service_account_name_matches_template() {
-        let d = build_deployment(&fixture(MCPGGatewaySpec::default()), "h", &[], None, None);
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec::default()),
+            "h",
+            &[],
+            None,
+            None,
+            &Default::default(),
+        );
         let pod = d.spec.unwrap().template.spec.unwrap();
         assert_eq!(
             pod.service_account_name.as_deref(),
@@ -900,6 +1020,7 @@ mod tests {
             &[],
             None,
             None,
+            &Default::default(),
         );
         let port = d.spec.unwrap().template.spec.unwrap().containers[0]
             .ports
@@ -930,6 +1051,7 @@ mod tests {
             &mounts,
             None,
             None,
+            &Default::default(),
         );
         let volumes = d.spec.unwrap().template.spec.unwrap().volumes.unwrap();
         let plugin_vols: Vec<_> = volumes.iter().filter(|v| v.secret.is_some()).collect();
@@ -954,6 +1076,7 @@ mod tests {
             &mounts,
             None,
             None,
+            &Default::default(),
         );
         let container_mounts = d.spec.unwrap().template.spec.unwrap().containers[0]
             .volume_mounts
@@ -978,6 +1101,7 @@ mod tests {
             &mounts,
             None,
             None,
+            &Default::default(),
         );
         let pod = d.spec.unwrap().template.spec.unwrap();
         let plugin_vol = pod
@@ -1010,6 +1134,7 @@ mod tests {
             &[],
             Some("set-h"),
             None,
+            &Default::default(),
         );
         let annotations = d
             .spec
@@ -1027,7 +1152,14 @@ mod tests {
 
     #[test]
     fn plugin_set_hash_omitted_when_no_set() {
-        let d = build_deployment(&fixture(MCPGGatewaySpec::default()), "h", &[], None, None);
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec::default()),
+            "h",
+            &[],
+            None,
+            None,
+            &Default::default(),
+        );
         let annotations = d
             .spec
             .unwrap()
@@ -1051,6 +1183,7 @@ mod tests {
             &[],
             None,
             Some(&rev),
+            &Default::default(),
         );
         let mounts = d.spec.unwrap().template.spec.unwrap().containers[0]
             .volume_mounts
@@ -1075,6 +1208,7 @@ mod tests {
             &[],
             None,
             Some(&rev),
+            &Default::default(),
         );
         let volumes = d.spec.unwrap().template.spec.unwrap().volumes.unwrap();
         let rev_vol = volumes
@@ -1101,6 +1235,7 @@ mod tests {
             &[],
             None,
             Some(&rev),
+            &Default::default(),
         );
         let annotations = d
             .spec

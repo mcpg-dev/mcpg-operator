@@ -199,6 +199,53 @@ const BAKED_SINK_PLUGINS: &[(&str, &str)] = &[
     ("dev.mcpg.observability.otlp", "telemetry_sink"),
 ];
 
+/// Give a cloud gateway a default traces pipeline when its author declared
+/// none: enabled, named, and pointed at the platform's OTLP collector via
+/// the dev.mcpg.observability.otlp sink (whose loader entry the sink pass
+/// appends — call this BEFORE `append_observability_sink_plugins`). A config
+/// that carries ANY `observability.traces` key is the author's — untouched.
+pub fn append_default_traces_block(
+    config: &mut Value,
+    url: &str,
+    gateway_name: &str,
+    namespace: &str,
+) {
+    if url.is_empty() {
+        return;
+    }
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let obs = obj
+        .entry("observability")
+        .or_insert_with(|| Value::Object(Default::default()));
+    let Some(obs_map) = obs.as_object_mut() else {
+        // the author set `observability` to something non-object — their
+        // config, their breakage; injecting into it would mask the error
+        return;
+    };
+    if obs_map.contains_key("traces") {
+        return;
+    }
+    obs_map.insert(
+        "traces".to_owned(),
+        serde_json::json!({
+            "enabled": true,
+            "service_name": "mcpg-gateway",
+            "sinks": [{
+                "kind": "dev.mcpg.observability.otlp",
+                "config": {
+                    "url": url,
+                    "resource_attributes": {
+                        "mcpg.gateway.name": gateway_name,
+                        "k8s.namespace.name": namespace,
+                    },
+                },
+            }],
+        }),
+    );
+}
+
 /// Sink ids named by the rendered config, in first-seen order.
 ///
 /// Reading this shape is a deliberate exception to the module's
@@ -1015,6 +1062,64 @@ mod tests {
         let mut config = with_metrics_sink("com.example.metrics.datadog");
         append_observability_sink_plugins(&mut config);
         assert!(config.get("plugins").is_none());
+    }
+
+    #[test]
+    fn default_traces_block_injected_when_absent_and_loadable() {
+        let mut config = serde_json::json!({ "gateway": {} });
+        append_default_traces_block(
+            &mut config,
+            "http://otel-collector.monitoring.svc:4317",
+            "acme-gw",
+            "tenant-acme",
+        );
+        let traces = &config["observability"]["traces"];
+        assert_eq!(traces["enabled"], true);
+        assert_eq!(traces["sinks"][0]["kind"], "dev.mcpg.observability.otlp");
+        assert_eq!(
+            traces["sinks"][0]["config"]["url"],
+            "http://otel-collector.monitoring.svc:4317"
+        );
+        assert_eq!(
+            traces["sinks"][0]["config"]["resource_attributes"]["mcpg.gateway.name"],
+            "acme-gw"
+        );
+        // the sink pass must now add the otlp plugin's loader entry
+        append_observability_sink_plugins(&mut config);
+        assert!(
+            plugin_ids(&config).contains("dev.mcpg.observability.otlp"),
+            "injected traces sink must get its loader entry"
+        );
+        // and the whole thing must still be a valid gateway config
+        let parsed: Result<mcpg::config::AppConfig, _> = serde_json::from_value(config.clone());
+        assert!(
+            parsed.is_ok(),
+            "injected block must satisfy AppConfig: {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn default_traces_block_never_touches_an_authored_traces_config() {
+        let mut config = serde_json::json!({
+            "observability": { "traces": { "enabled": false } }
+        });
+        append_default_traces_block(&mut config, "http://collector:4317", "gw", "ns");
+        assert_eq!(
+            config["observability"]["traces"],
+            serde_json::json!({ "enabled": false }),
+            "an authored traces block is the author's"
+        );
+    }
+
+    #[test]
+    fn default_traces_block_noops_on_empty_url_and_non_object_observability() {
+        let mut config = serde_json::json!({});
+        append_default_traces_block(&mut config, "", "gw", "ns");
+        assert!(config.get("observability").is_none());
+
+        let mut config = serde_json::json!({ "observability": "broken" });
+        append_default_traces_block(&mut config, "http://collector:4317", "gw", "ns");
+        assert_eq!(config["observability"], "broken");
     }
 
     #[test]
