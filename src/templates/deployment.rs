@@ -9,10 +9,11 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
-    Capabilities, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource, EnvVar,
-    EnvVarSource, HTTPGetAction, KeyToPath, ObjectFieldSelector, PodSecurityContext, PodSpec,
-    PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile, SecretVolumeSource,
-    SecurityContext, Volume, VolumeMount,
+    Capabilities, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource,
+    EnvFromSource, EnvVar, EnvVarSource, HTTPGetAction, KeyToPath, ObjectFieldSelector,
+    PodSecurityContext, PodSpec, PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile,
+    SecretEnvSource, SecretVolumeSource, SecurityContext, TopologySpreadConstraint, Volume,
+    VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
@@ -97,6 +98,10 @@ pub fn build_deployment(
     plugin_set_hash: Option<&str>,
     revocation_list: Option<&RevocationListMount>,
     default_pod_annotations: &BTreeMap<String, String>,
+    // Operator-derived `envFrom` Secrets appended after `spec.envFromSecrets`
+    // — e.g. the coordination Secret a bound managed MCPGCluster projects
+    // (NATS token + state key + CA). Empty on the common path.
+    extra_env_from_secrets: &[String],
 ) -> Deployment {
     let name = child_name(parent, "gateway");
     let labels = standard_labels(parent);
@@ -143,7 +148,13 @@ pub fn build_deployment(
                     revocation_list,
                     default_pod_annotations,
                 )),
-                spec: Some(build_pod_spec(parent, port, plugin_mounts, revocation_list)),
+                spec: Some(build_pod_spec(
+                    parent,
+                    port,
+                    plugin_mounts,
+                    revocation_list,
+                    extra_env_from_secrets,
+                )),
             },
             ..Default::default()
         }),
@@ -200,6 +211,7 @@ fn build_pod_spec(
     port: i32,
     plugin_mounts: &[PluginSecretMount],
     revocation_list: Option<&RevocationListMount>,
+    extra_env_from_secrets: &[String],
 ) -> PodSpec {
     PodSpec {
         service_account_name: Some(child_name(parent, "gateway")),
@@ -228,6 +240,7 @@ fn build_pod_spec(
             port,
             plugin_mounts,
             revocation_list,
+            extra_env_from_secrets,
         )],
         volumes: Some(build_volumes(parent, plugin_mounts, revocation_list)),
         node_selector: parent
@@ -246,8 +259,65 @@ fn build_pod_spec(
             .scheduling
             .as_ref()
             .and_then(|s| s.termination_grace_period_seconds),
+        topology_spread_constraints: build_topology_spread(parent),
         ..Default::default()
     }
+}
+
+/// Topology spread for the gateway pods. Explicit
+/// `spec.scheduling.topologySpreadConstraints` pass through (their label
+/// selector defaults to the gateway's pod selector when unset); otherwise a
+/// gateway whose replica ceiling exceeds 1 gets soft (`ScheduleAnyway`)
+/// node + zone spreading — replicas of a clustered gateway shouldn't
+/// co-locate onto one failure domain, while single-node dev clusters must
+/// still schedule.
+fn build_topology_spread(parent: &MCPGGateway) -> Option<Vec<TopologySpreadConstraint>> {
+    let own_selector = || LabelSelector {
+        match_labels: Some(selector_labels(parent)),
+        ..Default::default()
+    };
+
+    if let Some(s) = parent
+        .spec
+        .scheduling
+        .as_ref()
+        .filter(|s| !s.topology_spread_constraints.is_empty())
+    {
+        return Some(
+            s.topology_spread_constraints
+                .iter()
+                .map(|t| TopologySpreadConstraint {
+                    max_skew: t.max_skew,
+                    topology_key: t.topology_key.clone(),
+                    when_unsatisfiable: t.when_unsatisfiable.clone(),
+                    label_selector: Some(if t.label_selector_match_labels.is_empty() {
+                        own_selector()
+                    } else {
+                        LabelSelector {
+                            match_labels: Some(t.label_selector_match_labels.clone()),
+                            ..Default::default()
+                        }
+                    }),
+                    ..Default::default()
+                })
+                .collect(),
+        );
+    }
+
+    if parent.spec.effective_replica_ceiling().0 <= 1 {
+        return None;
+    }
+    let soft = |topology_key: &str| TopologySpreadConstraint {
+        max_skew: 1,
+        topology_key: topology_key.to_owned(),
+        when_unsatisfiable: "ScheduleAnyway".to_owned(),
+        label_selector: Some(own_selector()),
+        ..Default::default()
+    };
+    Some(vec![
+        soft("kubernetes.io/hostname"),
+        soft("topology.kubernetes.io/zone"),
+    ])
 }
 
 fn build_volumes(
@@ -344,6 +414,7 @@ fn build_main_container(
     port: i32,
     plugin_mounts: &[PluginSecretMount],
     revocation_list: Option<&RevocationListMount>,
+    extra_env_from_secrets: &[String],
 ) -> Container {
     let image_repo = parent
         .spec
@@ -385,6 +456,7 @@ fn build_main_container(
             ..Default::default()
         }]),
         env: Some(build_env_vars()),
+        env_from: build_env_from(parent, extra_env_from_secrets),
         resources: Some(build_resources(parent)),
         volume_mounts: Some(build_volume_mounts(plugin_mounts, revocation_list)),
         liveness_probe: Some(build_probe(
@@ -488,6 +560,38 @@ fn build_volume_mounts(
     }
 
     mounts
+}
+
+/// `envFrom` sources for the gateway container:
+/// `spec.envFromSecrets` in list order (later sources win on key
+/// collision per Kubernetes `envFrom` semantics). `None` when the
+/// list is empty. Marked non-optional so a missing Secret holds the
+/// pod at scheduling instead of booting a gateway whose
+/// `${env.*}` config references cannot resolve.
+fn build_env_from(parent: &MCPGGateway, extra_secrets: &[String]) -> Option<Vec<EnvFromSource>> {
+    if parent.spec.env_from_secrets.is_empty() && extra_secrets.is_empty() {
+        return None;
+    }
+    // `spec.envFromSecrets` first, then operator-derived sources (managed
+    // cluster coordination Secret) — later sources win on key collision per
+    // Kubernetes `envFrom` semantics.
+    let names = parent
+        .spec
+        .env_from_secrets
+        .iter()
+        .map(|s| s.name.clone())
+        .chain(extra_secrets.iter().cloned());
+    Some(
+        names
+            .map(|name| EnvFromSource {
+                secret_ref: Some(SecretEnvSource {
+                    name,
+                    optional: Some(false),
+                }),
+                ..Default::default()
+            })
+            .collect(),
+    )
 }
 
 fn build_env_vars() -> Vec<EnvVar> {
@@ -602,7 +706,7 @@ mod tests {
             ("prometheus.io/scrape".to_owned(), "true".to_owned()),
             ("prometheus.io/port".to_owned(), "8080".to_owned()),
         ]);
-        let d = build_deployment(&fixture(spec), "hash-1", &[], None, None, &defaults);
+        let d = build_deployment(&fixture(spec), "hash-1", &[], None, None, &defaults, &[]);
         let ann = d
             .spec
             .as_ref()
@@ -651,8 +755,105 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         assert_eq!(d.spec.unwrap().replicas, Some(5));
+    }
+
+    #[test]
+    fn multi_replica_pods_get_soft_topology_spread() {
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec {
+                replicas: 3,
+                ..Default::default()
+            }),
+            "h",
+            &[],
+            None,
+            None,
+            &Default::default(),
+            &[],
+        );
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        let spread = pod.topology_spread_constraints.expect("spread rendered");
+        let keys: Vec<&str> = spread.iter().map(|t| t.topology_key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["kubernetes.io/hostname", "topology.kubernetes.io/zone"]
+        );
+        for t in &spread {
+            assert_eq!(t.max_skew, 1);
+            assert_eq!(t.when_unsatisfiable, "ScheduleAnyway");
+            assert_eq!(
+                t.label_selector
+                    .as_ref()
+                    .unwrap()
+                    .match_labels
+                    .as_ref()
+                    .unwrap()["app.kubernetes.io/instance"],
+                "payments-gateway"
+            );
+        }
+    }
+
+    #[test]
+    fn single_replica_pods_get_no_topology_spread() {
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec {
+                replicas: 1,
+                ..Default::default()
+            }),
+            "h",
+            &[],
+            None,
+            None,
+            &Default::default(),
+            &[],
+        );
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        assert!(pod.topology_spread_constraints.is_none());
+    }
+
+    #[test]
+    fn explicit_topology_spread_passes_through() {
+        use mcpg_operator_api::v1alpha1::{GatewayScheduling, TopologySpread};
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec {
+                replicas: 3,
+                scheduling: Some(GatewayScheduling {
+                    topology_spread_constraints: vec![TopologySpread {
+                        max_skew: 2,
+                        topology_key: "topology.kubernetes.io/zone".into(),
+                        when_unsatisfiable: "DoNotSchedule".into(),
+                        label_selector_match_labels: Default::default(),
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            "h",
+            &[],
+            None,
+            None,
+            &Default::default(),
+            &[],
+        );
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        let spread = pod.topology_spread_constraints.expect("spread rendered");
+        assert_eq!(spread.len(), 1, "explicit constraints replace the defaults");
+        assert_eq!(spread[0].max_skew, 2);
+        assert_eq!(spread[0].when_unsatisfiable, "DoNotSchedule");
+        // An unset label selector defaults to the gateway's own pods.
+        assert_eq!(
+            spread[0]
+                .label_selector
+                .as_ref()
+                .unwrap()
+                .match_labels
+                .as_ref()
+                .unwrap()["app.kubernetes.io/name"],
+            "mcpg-gateway"
+        );
     }
 
     #[test]
@@ -664,6 +865,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let template = d.spec.unwrap().template;
         let annotations = template.metadata.unwrap().annotations.unwrap();
@@ -679,6 +881,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let pod = d.spec.unwrap().template.spec.unwrap();
         let pod_sec = pod.security_context.unwrap();
@@ -703,9 +906,69 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let pod = d.spec.unwrap().template.spec.unwrap();
         assert_eq!(pod.enable_service_links, Some(false));
+    }
+
+    #[test]
+    fn no_env_from_when_env_from_secrets_empty() {
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec::default()),
+            "h",
+            &[],
+            None,
+            None,
+            &Default::default(),
+            &[],
+        );
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        assert!(pod.containers[0].env_from.is_none());
+    }
+
+    #[test]
+    fn env_from_secrets_render_ordered_on_gateway_container() {
+        use mcpg_operator_api::v1alpha1::LocalObjectReference;
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec {
+                env_from_secrets: vec![
+                    LocalObjectReference {
+                        name: "mcpg-cluster-coordination".into(),
+                    },
+                    LocalObjectReference {
+                        name: "tenant-extra-env".into(),
+                    },
+                ],
+                ..Default::default()
+            }),
+            "h",
+            &[],
+            None,
+            None,
+            &Default::default(),
+            &[],
+        );
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        // The envFrom projection targets the gateway container and
+        // nothing else in the pod.
+        assert_eq!(pod.containers.len(), 1);
+        assert_eq!(pod.containers[0].name, "mcpg");
+        let env_from = pod.containers[0].env_from.as_ref().unwrap();
+        // List order preserved — later sources win on key collision.
+        let names: Vec<&str> = env_from
+            .iter()
+            .map(|e| e.secret_ref.as_ref().unwrap().name.as_str())
+            .collect();
+        assert_eq!(names, vec!["mcpg-cluster-coordination", "tenant-extra-env"]);
+        for e in env_from {
+            assert_eq!(
+                e.secret_ref.as_ref().unwrap().optional,
+                Some(false),
+                "a missing Secret must hold the pod, not boot an env-less gateway"
+            );
+            assert!(e.config_map_ref.is_none());
+        }
     }
 
     #[test]
@@ -721,6 +984,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let pod = d.spec.unwrap().template.spec.unwrap();
         let c = &pod.containers[0];
@@ -760,6 +1024,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let image = d.spec.unwrap().template.spec.unwrap().containers[0]
             .image
@@ -789,6 +1054,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let image = d.spec.unwrap().template.spec.unwrap().containers[0]
             .image
@@ -819,6 +1085,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let image = d.spec.unwrap().template.spec.unwrap().containers[0]
             .image
@@ -849,6 +1116,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let image = d.spec.unwrap().template.spec.unwrap().containers[0]
             .image
@@ -866,6 +1134,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let res = d.spec.unwrap().template.spec.unwrap().containers[0]
             .resources
@@ -893,6 +1162,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let res = d.spec.unwrap().template.spec.unwrap().containers[0]
             .resources
@@ -911,6 +1181,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let mounts = d.spec.unwrap().template.spec.unwrap().containers[0]
             .volume_mounts
@@ -932,6 +1203,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let volumes = d.spec.unwrap().template.spec.unwrap().volumes.unwrap();
         let cm_vol = volumes.iter().find(|v| v.name == "config").unwrap();
@@ -948,6 +1220,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let container = &d.spec.unwrap().template.spec.unwrap().containers[0];
         let liveness = container.liveness_probe.as_ref().unwrap();
@@ -978,6 +1251,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let pod_labels = d.spec.unwrap().template.metadata.unwrap().labels.unwrap();
         // Operator-managed key wins.
@@ -998,6 +1272,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let pod = d.spec.unwrap().template.spec.unwrap();
         assert_eq!(
@@ -1021,6 +1296,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let port = d.spec.unwrap().template.spec.unwrap().containers[0]
             .ports
@@ -1052,6 +1328,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let volumes = d.spec.unwrap().template.spec.unwrap().volumes.unwrap();
         let plugin_vols: Vec<_> = volumes.iter().filter(|v| v.secret.is_some()).collect();
@@ -1077,6 +1354,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let container_mounts = d.spec.unwrap().template.spec.unwrap().containers[0]
             .volume_mounts
@@ -1102,6 +1380,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let pod = d.spec.unwrap().template.spec.unwrap();
         let plugin_vol = pod
@@ -1135,6 +1414,7 @@ mod tests {
             Some("set-h"),
             None,
             &Default::default(),
+            &[],
         );
         let annotations = d
             .spec
@@ -1159,6 +1439,7 @@ mod tests {
             None,
             None,
             &Default::default(),
+            &[],
         );
         let annotations = d
             .spec
@@ -1184,6 +1465,7 @@ mod tests {
             None,
             Some(&rev),
             &Default::default(),
+            &[],
         );
         let mounts = d.spec.unwrap().template.spec.unwrap().containers[0]
             .volume_mounts
@@ -1209,6 +1491,7 @@ mod tests {
             None,
             Some(&rev),
             &Default::default(),
+            &[],
         );
         let volumes = d.spec.unwrap().template.spec.unwrap().volumes.unwrap();
         let rev_vol = volumes
@@ -1236,6 +1519,7 @@ mod tests {
             None,
             Some(&rev),
             &Default::default(),
+            &[],
         );
         let annotations = d
             .spec

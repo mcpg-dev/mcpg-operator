@@ -15,17 +15,22 @@ mod deployment;
 pub mod edge;
 pub mod hpa;
 pub mod httproute;
+pub mod managed_nats;
 pub mod pdb;
 pub mod plugin_render;
 mod server;
 mod service;
 mod service_account;
 
-pub use common::{owner_ref, selector_labels, standard_labels};
+pub use common::{child_name, owner_ref, selector_labels, standard_labels};
 pub use configmap::build_configmap;
 pub use deployment::{PluginSecretMount, RevocationListMount, build_deployment};
 pub use hpa::build_hpa;
 pub use httproute::{HTTPRoute, build_httproute};
+pub use managed_nats::{
+    MANAGED_CLUSTER_LABEL, build_nats_certificate, build_nats_client_service, build_nats_configmap,
+    build_nats_headless_service, build_nats_statefulset, managed_labels,
+};
 pub use pdb::build_pdb;
 pub use plugin_render::{
     CLOUD_PLUGIN_IMAGE_ROOT, REVOCATION_LIST_MOUNT_PATH, ResolvedSetEntry, ResolvedSetView,

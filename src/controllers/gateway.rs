@@ -29,7 +29,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
-use k8s_openapi::api::core::v1::{ConfigMap, Service, ServiceAccount};
+use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service, ServiceAccount};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::api::Api;
 use kube::core::ObjectMeta;
@@ -38,10 +38,11 @@ use kube::runtime::events::{Event as K8sEvent, EventType};
 use kube::runtime::reflector::ObjectRef;
 use kube::runtime::watcher;
 use kube::{Client, Resource, ResourceExt};
+use mcpg_operator_api::DEFAULT_OPERATOR_NAMESPACE;
 use mcpg_operator_api::conditions::{Condition, reasons, types as ctype};
 use mcpg_operator_api::v1alpha1::{
     MCPGCluster, MCPGGateway, MCPGGatewayStatus, MCPGPluginSet, MCPGRevocationList, MCPGRoute,
-    MCPGServer,
+    MCPGServer, managed_coordination_secret_name,
 };
 use rand::Rng;
 use sha2::{Digest, Sha256};
@@ -56,7 +57,7 @@ use crate::templates::{
     HTTPRoute, PluginSecretMount, REVOCATION_LIST_MOUNT_PATH, ResolvedSetEntry, ResolvedSetView,
     RevocationListMount, append_cloud_default_plugins, append_observability_sink_plugins,
     build_configmap, build_deployment, build_hpa, build_httproute, build_pdb, build_service,
-    build_service_account, cloud_default_plugin_ids, merge_plugins, owner_ref,
+    build_service_account, child_name, cloud_default_plugin_ids, merge_plugins, owner_ref,
 };
 use crate::{FIELD_MANAGER_PREFIX, labels as label_keys};
 
@@ -93,6 +94,7 @@ mod cluster_reason {
     pub const RESOLVED: &str = "ClusterResolved";
     pub const NOT_FOUND: &str = "ClusterNotFound";
     pub const NOT_READY: &str = "ClusterNotReady";
+    pub const SINGLE_NODE_BACKEND: &str = "SingleNodeBackend";
 }
 
 /// Condition type names emitted by this controller (in addition
@@ -138,16 +140,35 @@ struct ResolvedRevocationList {
 /// The gateway controller's view of a resolved `clusterRef`. The
 /// `cluster_block` is the rendered `cluster:` config object the
 /// gateway controller merges into the gateway config; `condition`
-/// is surfaced on the gateway status as `ClusterReady`. Resolution
-/// is best-effort: a not-found / not-ready cluster yields a
-/// `False` condition but an EMPTY `cluster_block` so the gateway
-/// keeps whatever it already had (inline `cluster:` or the
-/// single_node default) rather than wedging.
+/// is surfaced on the gateway status as `ClusterReady`. A `False`
+/// condition HOLDS the config reconcile (see `reconcile_inner`):
+/// rendering without the block would roll every replica back to
+/// `single_node` and drop the coordinator's shared state, so the
+/// last rendered config stays live instead.
+#[derive(Debug)]
 struct ResolvedCluster {
-    /// `{ "kind": <backend>, <flattened config> }`, or empty when
+    /// `{ "kind": <backend>, <flattened config> }`, or `Null` when
     /// the cluster didn't resolve to a usable backend.
     cluster_block: serde_json::Value,
     condition: Condition,
+    /// For a **managed** coordinator: the generated coordination Secret to
+    /// copy into the gateway's namespace and project via `envFrom` (NATS
+    /// token + state key [+ CA]). `None` for a point-at-existing cluster —
+    /// its credentials, if any, ride the gateway's own `envFromSecrets` /
+    /// `credentialRefs`.
+    coordination: Option<CoordinationProjection>,
+}
+
+/// A managed cluster's coordination Secret, ready to materialise into the
+/// bound gateway's namespace. Pods can only project same-namespace
+/// Secrets, so the operator copies the operator-namespace source here and
+/// wires it onto the deployment's `envFrom`.
+#[derive(Debug)]
+struct CoordinationProjection {
+    /// Secret name (identical in the source + gateway namespaces).
+    secret_name: String,
+    /// The source Secret's data (token + state key [+ CA]).
+    data: std::collections::BTreeMap<String, k8s_openapi::ByteString>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -460,13 +481,13 @@ async fn reconcile_inner(
             );
     }
 
-    // Step 1c: resolve clusterRef (when set). The cluster controller
-    // owns the binding's Ready gate; here we just render its
-    // `cluster:` block into the gateway config. A missing/not-ready
-    // cluster surfaces a condition but does NOT block the gateway —
-    // it falls back to whatever `spec.config.cluster` carries (or the
-    // single_node default), so a cluster edit can't wedge a running
-    // gateway.
+    // Step 1c: resolve clusterRef (when set) into the backend's
+    // `cluster:` block. A binding that doesn't resolve to a usable
+    // coordinator HOLDS the config reconcile: rendering without the
+    // block would force-SSA a `single_node` ConfigMap and roll every
+    // replica off the shared coordinator, losing its state. The last
+    // rendered config stays live; the MCPGCluster watch re-reconciles
+    // the moment the cluster transitions, with the requeue as backstop.
     let cluster = resolve_cluster(&ctx.client, obj.as_ref()).await?;
     if let Some(c) = &cluster
         && c.condition.status != "True"
@@ -474,6 +495,61 @@ async fn reconcile_inner(
         ctx.metrics
             .operator_metrics()
             .observe_dependency_unresolved(CONTROLLER_NAME, "MCPGCluster", &c.condition.reason);
+
+        // Carry the previous status forward (the status patch is a
+        // force-SSA: absent fields would be pruned from our manager)
+        // and only update the conditions + bookkeeping.
+        let mut status = obj.status.clone().unwrap_or_default();
+        let mut cluster_cond = c.condition.clone();
+        cluster_cond.observed_generation = Some(observed_generation);
+        mcpg_operator_api::conditions::set_condition(&mut status.conditions, cluster_cond);
+        mcpg_operator_api::conditions::set_condition(
+            &mut status.conditions,
+            Condition::new(
+                ctype::READY,
+                "False",
+                reasons::DEPENDENCY_PENDING,
+                format!(
+                    "config reconcile held (last rendered config stays live): {}",
+                    c.condition.message
+                ),
+                Some(observed_generation),
+            ),
+        );
+        status.observed_generation = Some(observed_generation);
+        status.last_reconcile_time = Some(Utc::now());
+        if let Err(e) = patch_status(&api, &name, &status, &fm).await {
+            warn!(error = ?e, "status patch failed");
+        }
+
+        let evt = K8sEvent {
+            type_: EventType::Warning,
+            reason: c.condition.reason.clone(),
+            note: Some(format!(
+                "holding config reconcile: {} (the last rendered config keeps serving)",
+                c.condition.message
+            )),
+            action: "ResolveCluster".into(),
+            secondary: None,
+        };
+        if let Err(e) = ctx
+            .recorders
+            .gateway
+            .publish(&evt, &obj.object_ref(&()))
+            .await
+        {
+            warn!(error = ?e, "gateway: failed to publish cluster-hold event");
+        }
+
+        // The hold is a deliberate wait, not a failure — reset the
+        // per-resource backoff like any completed reconcile.
+        ctx.backoff
+            .record_success(&crate::backoff::resource_key(CONTROLLER_NAME, &ns, &name));
+
+        return Ok((
+            Action::requeue(Duration::from_secs(30)),
+            ReconcileOutcome::DependencyPending,
+        ));
     }
 
     // Step 2: compute desired state. The merged config is the
@@ -536,6 +612,24 @@ async fn reconcile_inner(
         ctx.config.default_otlp_traces_url.as_deref(),
         &mut merged_config,
     );
+    // Managed coordinator: copy its generated coordination Secret into this
+    // gateway's namespace (pods can only project same-namespace Secrets) and
+    // wire it onto the deployment's `envFrom` so the `${env.*}` cluster-block
+    // refs (NATS token, state-encryption key, CA) resolve at boot.
+    let coordination_copy = cluster
+        .as_ref()
+        .and_then(|c| c.coordination.as_ref())
+        .map(|proj| {
+            (
+                proj.secret_name.clone(),
+                build_coordination_secret_copy(&obj, &ns, proj),
+            )
+        });
+    let extra_env_from: Vec<String> = coordination_copy
+        .as_ref()
+        .map(|(name, _)| vec![name.clone()])
+        .unwrap_or_default();
+
     let (cm, config_hash) = build_configmap(&obj, &merged_config);
     let svc = build_service(&obj);
     let sa = build_service_account(&obj);
@@ -549,6 +643,7 @@ async fn reconcile_inner(
         plugin_set.as_ref().map(|p| p.resolved_hash.as_str()),
         revocation_list.as_ref().map(|r| &r.mount),
         &ctx.config.gateway_pod_annotations_map(),
+        &extra_env_from,
     );
 
     // Step 3: SSA each child.
@@ -560,6 +655,24 @@ async fn reconcile_inner(
     apply_owned(&cm_api, &cm, &fm).await?;
     apply_owned(&svc_api, &svc, &fm).await?;
     apply_owned(&sa_api, &sa, &fm).await?;
+    // The coordination Secret must exist before the pod that projects it, so
+    // apply the copy ahead of the Deployment. The chart grants no cluster-wide
+    // secrets-write; reach is per-namespace via the mcpg-operator-tenant-secrets
+    // RoleBinding — ensure it here (idempotent) rather than assuming the
+    // plugin-set controller made it, since a managed gateway may carry no
+    // pluginSetRef.
+    if let Some((_, secret)) = &coordination_copy {
+        crate::rbac::ensure_tenant_secret_binding(
+            &ctx.client,
+            &ns,
+            DEFAULT_OPERATOR_NAMESPACE,
+            &ctx.config.operator_service_account,
+            &fm,
+        )
+        .await?;
+        let secret_api: Api<Secret> = Api::namespaced(ctx.client.clone(), &ns);
+        apply_owned(&secret_api, secret, &fm).await?;
+    }
     let applied_dep = apply_owned(&dep_api, &dep, &fm).await?;
 
     // Managed-cloud only: SSA the per-instance HTTPRoute so the shared edge
@@ -583,9 +696,17 @@ async fn reconcile_inner(
         let hpa_api: Api<HorizontalPodAutoscaler> = Api::namespaced(ctx.client.clone(), &ns);
         apply_owned(&hpa_api, &hpa, &fm).await?;
     }
+    let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(ctx.client.clone(), &ns);
     if let Some(pdb) = build_pdb(&obj) {
-        let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(ctx.client.clone(), &ns);
         apply_owned(&pdb_api, &pdb, &fm).await?;
+    } else {
+        // No PDB in the desired state (single-replica, or explicitly
+        // disabled): delete any previously-rendered one so a stale
+        // budget doesn't linger past a scale-down. Best-effort — 404
+        // is the common case.
+        let _ = pdb_api
+            .delete(&child_name(&obj, "gateway"), &Default::default())
+            .await;
     }
 
     // Step 4: observe Deployment status to populate replica
@@ -718,6 +839,8 @@ async fn reconcile_inner(
     // - any unresolved ref the user asked for → DependencyPending
     //   (operator is healthy, just waiting on another CRD)
     // - everything resolved → Success
+    // An unresolved clusterRef never reaches this point — it holds
+    // the reconcile with an early return at step 1c.
     let dependency_pending = plugin_set.as_ref().is_some_and(|p| p.view.is_none())
         || revocation_list
             .as_ref()
@@ -1337,13 +1460,9 @@ fn revocation_cm_name(obj: &MCPGGateway) -> String {
 // ─────────────────────────────────────────────────────────────────
 
 /// Resolve the gateway's `clusterRef` into a rendered `cluster:`
-/// config block. Best-effort by design: a missing or not-`Ready`
-/// `MCPGCluster` produces a `ClusterReady=False` condition but an
-/// empty block, so the gateway keeps whatever `cluster:` its inline
-/// `spec.config` carried (or falls back to the gateway's own
-/// `single_node` default). This means editing/deleting an
-/// `MCPGCluster` can never hard-wedge an already-running gateway —
-/// it only stops *new* config from rendering the backend block.
+/// config block. A `False` condition (missing / not-Ready cluster,
+/// or a `single_node` backend behind a multi-replica gateway) makes
+/// the reconcile hold rather than render config without the block.
 ///
 /// Returns `Ok(None)` when the gateway has no `clusterRef` (the
 /// common single-replica case — no condition, no block).
@@ -1354,66 +1473,106 @@ async fn resolve_cluster(
     let Some(cluster_ref) = obj.spec.cluster_ref.as_ref() else {
         return Ok(None);
     };
-    let name = &cluster_ref.name;
     let api: Api<MCPGCluster> = Api::all(client.clone());
+    let cluster = api.get_opt(&cluster_ref.name).await?;
+    let mut resolved = classify_cluster_binding(obj, cluster.as_ref());
 
-    let cluster = match api.get_opt(name).await? {
-        Some(c) => c,
-        None => {
-            return Ok(Some(ResolvedCluster {
-                cluster_block: serde_json::Value::Null,
-                condition: Condition::new(
-                    cond_types::CLUSTER_READY,
-                    "False",
-                    cluster_reason::NOT_FOUND,
-                    format!("MCPGCluster/{name} not found; keeping existing cluster config"),
-                    None,
-                ),
-            }));
+    // Managed coordinator that resolved cleanly: fetch its generated
+    // coordination Secret from the operator namespace so the reconcile can
+    // copy it into the gateway namespace and project it via `envFrom`. The
+    // gateway's `${env.*}` config refs (token, state key, CA) resolve from
+    // it at boot. Only when the binding is Ready (block rendered), so the
+    // hold path never touches Secrets.
+    if resolved.condition.status == "True"
+        && let Some(cluster) = cluster.as_ref()
+        && let Some(cluster_name) = cluster.metadata.name.as_deref()
+        && cluster.spec.managed.is_some()
+    {
+        let secret_name = managed_coordination_secret_name(cluster_name);
+        let source_api: Api<Secret> = Api::namespaced(client.clone(), DEFAULT_OPERATOR_NAMESPACE);
+        if let Some(source) = source_api.get_opt(&secret_name).await?
+            && let Some(data) = source.data
+        {
+            resolved.coordination = Some(CoordinationProjection { secret_name, data });
         }
+    }
+
+    Ok(Some(resolved))
+}
+
+/// Turn the fetched `MCPGCluster` (or its absence) into the binding
+/// verdict the reconcile acts on. Pure so the hold matrix unit-tests
+/// without a cluster.
+fn classify_cluster_binding(obj: &MCPGGateway, cluster: Option<&MCPGCluster>) -> ResolvedCluster {
+    let name = obj
+        .spec
+        .cluster_ref
+        .as_ref()
+        .map(|r| r.name.as_str())
+        .unwrap_or_default();
+
+    let unresolved = |reason: &str, message: String| ResolvedCluster {
+        cluster_block: serde_json::Value::Null,
+        condition: Condition::new(cond_types::CLUSTER_READY, "False", reason, message, None),
+        coordination: None,
+    };
+
+    let Some(cluster) = cluster else {
+        return unresolved(
+            cluster_reason::NOT_FOUND,
+            format!("MCPGCluster/{name} not found"),
+        );
     };
 
     // Honour the cluster controller's own readiness verdict — if the
     // backend isn't bindable (e.g. its pinned cluster plugin isn't
     // verified) we don't render the block, so a gateway can't be
     // pointed at an unverified coordinator.
-    let cluster_ready = cluster
-        .status
-        .as_ref()
-        .map(|s| {
-            s.conditions
-                .iter()
-                .any(|c| c.r#type == ctype::READY && c.status == "True")
-        })
-        .unwrap_or(false);
-
+    let cluster_ready = cluster.status.as_ref().is_some_and(|s| {
+        s.conditions
+            .iter()
+            .any(|c| c.r#type == ctype::READY && c.status == "True")
+    });
     if !cluster_ready {
-        return Ok(Some(ResolvedCluster {
-            cluster_block: serde_json::Value::Null,
-            condition: Condition::new(
-                cond_types::CLUSTER_READY,
-                "False",
-                cluster_reason::NOT_READY,
-                format!("MCPGCluster/{name} is not Ready; keeping existing cluster config"),
-                None,
-            ),
-        }));
+        return unresolved(
+            cluster_reason::NOT_READY,
+            format!("MCPGCluster/{name} is not Ready"),
+        );
     }
 
-    let block = cluster.spec.render_cluster_block();
-    Ok(Some(ResolvedCluster {
-        cluster_block: block,
+    // A Ready single_node cluster is bindable only by one replica —
+    // rendering it into a multi-replica gateway would fork sessions /
+    // pub-sub / idempotency state per pod. Admission rejects this
+    // shape; the gate here also covers objects that predate it or
+    // bypassed the webhook. A managed coordinator is effectively NATS,
+    // so it never trips this.
+    let (ceiling, field) = obj.spec.effective_replica_ceiling();
+    if cluster.spec.is_effectively_single_node() && ceiling > 1 {
+        return unresolved(
+            cluster_reason::SINGLE_NODE_BACKEND,
+            format!(
+                "MCPGCluster/{name} provides the single_node backend, which cannot \
+                 coordinate {field}={ceiling}; reference a non-single_node MCPGCluster"
+            ),
+        );
+    }
+
+    ResolvedCluster {
+        cluster_block: cluster
+            .spec
+            .render_cluster_block_with(name, DEFAULT_OPERATOR_NAMESPACE),
         condition: Condition::new(
             cond_types::CLUSTER_READY,
             "True",
             cluster_reason::RESOLVED,
             format!(
                 "bound MCPGCluster/{name} (backend: {})",
-                cluster.spec.backend.config_kind()
+                cluster.spec.effective_backend().config_kind()
             ),
             None,
         ),
-    }))
+        coordination: None,
+    }
 }
 
 /// Overlay the rendered `cluster:` block onto the merged gateway
@@ -1421,7 +1580,7 @@ async fn resolve_cluster(
 /// it REPLACES any inline `config.cluster` (operators using
 /// `clusterRef` shouldn't also hand-write `cluster:`; the ref wins,
 /// same policy as `pluginSetRef` replacing inline plugin entries).
-/// A `Null` block (cluster not resolved) is a no-op.
+/// A `Null` block is a no-op.
 fn merge_cluster_block(config: &mut serde_json::Value, cluster_block: &serde_json::Value) {
     if cluster_block.is_null() {
         return;
@@ -1431,6 +1590,34 @@ fn merge_cluster_block(config: &mut serde_json::Value, cluster_block: &serde_jso
     }
     if let Some(obj) = config.as_object_mut() {
         obj.insert("cluster".to_owned(), cluster_block.clone());
+    }
+}
+
+/// Build the gateway-namespace copy of a managed cluster's coordination
+/// Secret. Owned by the gateway (namespaced → namespaced) so K8s GC removes
+/// it when the gateway is deleted. Not immutable — the CA can rotate.
+fn build_coordination_secret_copy(
+    gw: &MCPGGateway,
+    namespace: &str,
+    proj: &CoordinationProjection,
+) -> Secret {
+    let mut labels = BTreeMap::new();
+    labels.insert(
+        "app.kubernetes.io/managed-by".to_owned(),
+        "mcpg-operator".to_owned(),
+    );
+    labels.insert(label_keys::MCPG_GATEWAY.to_owned(), gw.name_any());
+    Secret {
+        metadata: ObjectMeta {
+            name: Some(proj.secret_name.clone()),
+            namespace: Some(namespace.to_owned()),
+            labels: Some(labels),
+            owner_references: Some(vec![owner_ref(gw)]),
+            ..Default::default()
+        },
+        type_: Some("Opaque".to_owned()),
+        data: Some(proj.data.clone()),
+        ..Default::default()
     }
 }
 
@@ -2361,9 +2548,9 @@ mod tests {
     #[test]
     fn merge_cluster_block_initialises_non_object_config() {
         let mut config = serde_json::Value::Null;
-        let block = serde_json::json!({ "kind": "etcd", "endpoints": ["http://e:2379"] });
+        let block = serde_json::json!({ "kind": "redis", "url": "rediss://r:6379" });
         merge_cluster_block(&mut config, &block);
-        assert_eq!(config["cluster"]["kind"], "etcd");
+        assert_eq!(config["cluster"]["kind"], "redis");
     }
 
     #[test]
@@ -2666,5 +2853,110 @@ mod tests {
         assert_eq!(feds[0]["naming"]["tool_prefix"], "crm_");
         assert_eq!(feds[0]["governance"]["minimum_trust"], "verified");
         assert_eq!(feds[0]["upstream"]["auth"]["mode"], "pass_through");
+    }
+
+    // ── clusterRef binding classification (drives the hold) ────
+
+    fn bound_gateway(replicas: i32) -> MCPGGateway {
+        MCPGGateway {
+            metadata: ObjectMeta {
+                name: Some("gw".into()),
+                namespace: Some("prod".into()),
+                ..Default::default()
+            },
+            spec: mcpg_operator_api::v1alpha1::MCPGGatewaySpec {
+                replicas,
+                cluster_ref: Some(mcpg_operator_api::v1alpha1::ClusterRef {
+                    name: "prod-cluster".into(),
+                }),
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    fn cluster_with(
+        backend: mcpg_operator_api::v1alpha1::ClusterBackend,
+        ready: bool,
+    ) -> MCPGCluster {
+        MCPGCluster {
+            metadata: ObjectMeta {
+                name: Some("prod-cluster".into()),
+                ..Default::default()
+            },
+            spec: mcpg_operator_api::v1alpha1::MCPGClusterSpec {
+                backend,
+                config: if backend == mcpg_operator_api::v1alpha1::ClusterBackend::Redis {
+                    [(
+                        "url".to_owned(),
+                        serde_json::json!("rediss://r.prod.svc:6379"),
+                    )]
+                    .into_iter()
+                    .collect()
+                } else {
+                    Default::default()
+                },
+                ..Default::default()
+            },
+            status: Some(mcpg_operator_api::v1alpha1::MCPGClusterStatus {
+                conditions: vec![if ready {
+                    Condition::ready_true(reasons::RECONCILED)
+                } else {
+                    Condition::ready_false(reasons::DEPENDENCY_PENDING, "plugin unverified")
+                }],
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// A `False` verdict is what makes the reconcile hold instead of
+    /// rendering — every unresolved variant must carry it, with a
+    /// `Null` block so nothing can merge by accident.
+    fn assert_holds(resolved: &ResolvedCluster, reason: &str) {
+        assert_eq!(resolved.condition.status, "False");
+        assert_eq!(resolved.condition.reason, reason, "{resolved:?}");
+        assert!(resolved.cluster_block.is_null());
+    }
+
+    #[test]
+    fn missing_cluster_holds() {
+        let r = classify_cluster_binding(&bound_gateway(3), None);
+        assert_holds(&r, cluster_reason::NOT_FOUND);
+        assert!(r.condition.message.contains("prod-cluster"));
+    }
+
+    #[test]
+    fn unready_cluster_holds() {
+        let c = cluster_with(mcpg_operator_api::v1alpha1::ClusterBackend::Redis, false);
+        let r = classify_cluster_binding(&bound_gateway(3), Some(&c));
+        assert_holds(&r, cluster_reason::NOT_READY);
+        // The hold also applies at replicas=1 — an unready coordinator
+        // must never be rendered into anyone's config.
+        let r = classify_cluster_binding(&bound_gateway(1), Some(&c));
+        assert_holds(&r, cluster_reason::NOT_READY);
+    }
+
+    #[test]
+    fn ready_single_node_backend_holds_multi_replica_only() {
+        let c = cluster_with(
+            mcpg_operator_api::v1alpha1::ClusterBackend::SingleNode,
+            true,
+        );
+        let r = classify_cluster_binding(&bound_gateway(3), Some(&c));
+        assert_holds(&r, cluster_reason::SINGLE_NODE_BACKEND);
+        // One replica may bind a single_node cluster.
+        let r = classify_cluster_binding(&bound_gateway(1), Some(&c));
+        assert_eq!(r.condition.status, "True");
+        assert_eq!(r.cluster_block["kind"], "single_node");
+    }
+
+    #[test]
+    fn ready_cluster_resolves_the_rendered_block() {
+        let c = cluster_with(mcpg_operator_api::v1alpha1::ClusterBackend::Redis, true);
+        let r = classify_cluster_binding(&bound_gateway(3), Some(&c));
+        assert_eq!(r.condition.status, "True");
+        assert_eq!(r.condition.reason, cluster_reason::RESOLVED);
+        assert_eq!(r.cluster_block["kind"], "redis");
+        assert_eq!(r.cluster_block["url"], "rediss://r.prod.svc:6379");
     }
 }

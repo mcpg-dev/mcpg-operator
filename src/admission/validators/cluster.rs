@@ -56,11 +56,31 @@ pub async fn validate(
 fn validate_spec(obj: &MCPGCluster) -> Result<(), String> {
     let spec = &obj.spec;
 
-    if spec.backend.is_single_node() {
+    if let Some(managed) = &spec.managed {
+        // Managed: the operator generates the backend (always NATS) + the
+        // `cluster:` config. Reject a spec that also pins either — a stray
+        // `backend`/`config` alongside `managed` is a misconfiguration.
+        if !spec.backend.is_single_node() {
+            return Err(
+                "spec.managed and spec.backend are mutually exclusive — a managed coordinator \
+                 is always NATS. Remove spec.backend (leave it at its default)."
+                    .to_owned(),
+            );
+        }
+        if !spec.config.is_empty() {
+            return Err(
+                "spec.managed and spec.config are mutually exclusive — the operator generates \
+                 the coordinator `cluster:` block for a managed cluster. Remove spec.config."
+                    .to_owned(),
+            );
+        }
+        validate_managed(managed)?;
+    } else if spec.backend.is_single_node() {
         if !spec.config.is_empty() {
             return Err(
                 "spec.config must be empty for the single_node backend (it takes no \
-                 parameters). Did you mean to set spec.backend to redis / nats / consul / etcd?"
+                 parameters). Did you mean to set spec.backend to redis / nats, \
+                 or spec.managed for an operator-provisioned NATS coordinator?"
                     .to_owned(),
             );
         }
@@ -75,7 +95,10 @@ fn validate_spec(obj: &MCPGCluster) -> Result<(), String> {
     // Transport-security parity with the gateway boot guard: reject a
     // plaintext coordinator at admission rather than letting it CrashLoop the
     // bound gateway pods with an opaque error. Opt out per-cluster with
-    // `spec.config.allow_insecure_transport: true` (local/dev only).
+    // `spec.config.allow_insecure_transport: true` (local/dev only). A
+    // managed coordinator has no user `config`, so this is inert there — its
+    // (in-cluster plaintext vs cert-manager TLS) posture is set by
+    // `managed.tls` and surfaced as a controller event.
     if let Some(reason) = spec.insecure_transport_reason() {
         return Err(format!(
             "spec.config: {reason}. The cluster coordinator carries all shared state \
@@ -104,6 +127,30 @@ fn validate_spec(obj: &MCPGCluster) -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+/// Shape checks for a managed coordinator the OpenAPI schema can't express.
+fn validate_managed(
+    managed: &mcpg_operator_api::v1alpha1::ManagedCoordinator,
+) -> Result<(), String> {
+    if managed.replicas == Some(0) {
+        return Err(
+            "spec.managed.replicas must be >= 1 (it is capped at 1 in this \
+                    version regardless)"
+                .to_owned(),
+        );
+    }
+    if let Some(tls) = &managed.tls
+        && let Some(issuer) = &tls.issuer_ref
+        && issuer.name.trim().is_empty()
+    {
+        return Err(
+            "spec.managed.tls.issuerRef.name must not be empty when spec.managed.tls is set \
+             (name the cert-manager Issuer/ClusterIssuer to provision the NATS server cert)."
+                .to_owned(),
+        );
+    }
     Ok(())
 }
 
@@ -249,39 +296,6 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_consul_rejected() {
-        let s = MCPGClusterSpec {
-            backend: ClusterBackend::Consul,
-            config: cfg(&[("address", "http://consul:8500")]),
-            ..Default::default()
-        };
-        assert!(validate_spec(&fixture(s)).unwrap_err().contains("https://"));
-    }
-
-    #[test]
-    fn scheme_less_etcd_rejected() {
-        let s = MCPGClusterSpec {
-            backend: ClusterBackend::Etcd,
-            config: cfg_json(serde_json::json!({ "endpoints": ["etcd-0:2379"] })),
-            ..Default::default()
-        };
-        assert!(validate_spec(&fixture(s)).unwrap_err().contains("https://"));
-    }
-
-    #[test]
-    fn https_etcd_ok() {
-        let s = MCPGClusterSpec {
-            backend: ClusterBackend::Etcd,
-            config: cfg_json(serde_json::json!({
-                "endpoints": ["https://etcd-0:2379"],
-                "tls": {}
-            })),
-            ..Default::default()
-        };
-        validate_spec(&fixture(s)).unwrap();
-    }
-
-    #[test]
     fn nats_require_tls_false_rejected() {
         let s = MCPGClusterSpec {
             backend: ClusterBackend::Nats,
@@ -315,5 +329,96 @@ mod tests {
                 .unwrap_err()
                 .contains("secretName")
         );
+    }
+
+    // ── Managed coordinator ────────────────────────────────────
+
+    use mcpg_operator_api::v1alpha1::{
+        ManagedCoordinator, ManagedCoordinatorTls, ManagedIssuerRef,
+    };
+
+    #[test]
+    fn managed_alone_ok() {
+        let s = MCPGClusterSpec {
+            managed: Some(ManagedCoordinator::default()),
+            ..Default::default()
+        };
+        validate_spec(&fixture(s)).unwrap();
+    }
+
+    #[test]
+    fn managed_with_backend_rejected() {
+        let s = MCPGClusterSpec {
+            backend: ClusterBackend::Redis,
+            config: cfg(&[("url", "rediss://r:6379")]),
+            managed: Some(ManagedCoordinator::default()),
+            ..Default::default()
+        };
+        let err = validate_spec(&fixture(s)).unwrap_err();
+        assert!(err.contains("spec.backend"), "{err}");
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn managed_with_config_rejected() {
+        // backend left at default (single_node) but config set alongside managed.
+        let s = MCPGClusterSpec {
+            config: cfg(&[("servers", "nats://n:4222")]),
+            managed: Some(ManagedCoordinator::default()),
+            ..Default::default()
+        };
+        let err = validate_spec(&fixture(s)).unwrap_err();
+        assert!(err.contains("spec.config"), "{err}");
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn managed_tls_empty_issuer_name_rejected() {
+        let s = MCPGClusterSpec {
+            managed: Some(ManagedCoordinator {
+                tls: Some(ManagedCoordinatorTls {
+                    issuer_ref: Some(ManagedIssuerRef {
+                        name: "  ".into(),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            validate_spec(&fixture(s))
+                .unwrap_err()
+                .contains("issuerRef.name")
+        );
+    }
+
+    #[test]
+    fn managed_tls_with_issuer_ok() {
+        let s = MCPGClusterSpec {
+            managed: Some(ManagedCoordinator {
+                tls: Some(ManagedCoordinatorTls {
+                    issuer_ref: Some(ManagedIssuerRef {
+                        name: "mcpg-internal".into(),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        validate_spec(&fixture(s)).unwrap();
+    }
+
+    #[test]
+    fn managed_zero_replicas_rejected() {
+        let s = MCPGClusterSpec {
+            managed: Some(ManagedCoordinator {
+                replicas: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(validate_spec(&fixture(s)).unwrap_err().contains("replicas"));
     }
 }

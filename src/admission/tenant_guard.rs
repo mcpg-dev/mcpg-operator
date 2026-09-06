@@ -21,9 +21,7 @@
 //! — exactly today's behaviour, preserving opt-in compatibility.
 
 use kube::api::Api;
-use mcpg_operator_api::v1alpha1::{
-    MCPGGateway, MCPGGatewaySpec, MCPGPlugin, MCPGPluginSet, MCPGTenant,
-};
+use mcpg_operator_api::v1alpha1::{MCPGGateway, MCPGPlugin, MCPGPluginSet, MCPGTenant};
 use tracing::warn;
 
 /// Find the `MCPGTenant` that owns `namespace`, if any. Lists tenants
@@ -86,27 +84,6 @@ pub async fn enforce_pluginset_allowlist(
     Ok(())
 }
 
-/// The maximum replica count a gateway can actually reach. When autoscaling is
-/// enabled the HPA's upper bound is the real ceiling (the Deployment drops its
-/// static `replicas` — see `templates/deployment.rs`), mirroring the operator's
-/// HPA `max_replicas` defaulting; otherwise the static `spec.replicas`.
-///
-/// Pure so it unit-tests without a cluster. Returns `(ceiling, field)` where
-/// `field` names the spec path responsible (for a clear admission error).
-pub fn effective_replica_ceiling(spec: &MCPGGatewaySpec) -> (i64, &'static str) {
-    match spec.autoscaling.as_ref().filter(|a| a.enabled) {
-        Some(a) => {
-            let min = a.min_replicas.unwrap_or(1).max(1);
-            let max = a
-                .max_replicas
-                .unwrap_or_else(|| spec.replicas.max(min))
-                .max(min);
-            (i64::from(max), "spec.autoscaling.maxReplicas")
-        }
-        None => (i64::from(spec.replicas), "spec.replicas"),
-    }
-}
-
 /// Enforce the tenant per-gateway replica cap for an `MCPGGateway`. Checks the
 /// *effective* ceiling, so an HPA can't scale past the cap the static-replica
 /// check enforces.
@@ -126,7 +103,8 @@ pub async fn enforce_gateway_replica_cap(
         .as_ref()
         .and_then(|q| q.max_replicas_per_gateway);
     if let Some(max) = cap {
-        let (ceiling, field) = effective_replica_ceiling(&obj.spec);
+        let (ceiling, field) = obj.spec.effective_replica_ceiling();
+        let ceiling = i64::from(ceiling);
         if ceiling > max {
             let tenant_name = tenant.metadata.name.as_deref().unwrap_or("<tenant>");
             return Err(format!(
@@ -135,64 +113,4 @@ pub async fn enforce_gateway_replica_cap(
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use mcpg_operator_api::v1alpha1::HorizontalAutoscaler;
-
-    fn spec(replicas: i32, autoscaling: Option<HorizontalAutoscaler>) -> MCPGGatewaySpec {
-        MCPGGatewaySpec {
-            replicas,
-            autoscaling,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn ceiling_is_static_replicas_without_autoscaling() {
-        let (c, f) = effective_replica_ceiling(&spec(3, None));
-        assert_eq!((c, f), (3, "spec.replicas"));
-        // Disabled autoscaling falls back to static replicas too.
-        let (c, f) = effective_replica_ceiling(&spec(
-            3,
-            Some(HorizontalAutoscaler {
-                enabled: false,
-                max_replicas: Some(99),
-                ..Default::default()
-            }),
-        ));
-        assert_eq!((c, f), (3, "spec.replicas"));
-    }
-
-    #[test]
-    fn ceiling_is_hpa_max_when_autoscaling_enabled() {
-        // The HPA ceiling — not the static replicas — is what a cap must bound.
-        let (c, f) = effective_replica_ceiling(&spec(
-            1,
-            Some(HorizontalAutoscaler {
-                enabled: true,
-                min_replicas: Some(2),
-                max_replicas: Some(20),
-                ..Default::default()
-            }),
-        ));
-        assert_eq!((c, f), (20, "spec.autoscaling.maxReplicas"));
-    }
-
-    #[test]
-    fn hpa_ceiling_defaults_like_the_renderer_when_max_omitted() {
-        // max omitted → max(replicas, min); here replicas=4, min=2 → 4.
-        let (c, _) = effective_replica_ceiling(&spec(
-            4,
-            Some(HorizontalAutoscaler {
-                enabled: true,
-                min_replicas: Some(2),
-                max_replicas: None,
-                ..Default::default()
-            }),
-        ));
-        assert_eq!(c, 4);
-    }
 }
