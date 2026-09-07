@@ -2178,11 +2178,11 @@ mod tests {
         let entries = cfg["plugins"].as_array().expect("plugins array rendered");
         assert_eq!(entries.len(), 5);
         assert!(
-            entries.iter().all(|e| e["source"]["path"]
+            entries.iter().all(|e| e["source"]["oci"]
                 .as_str()
                 .unwrap()
-                .starts_with("/usr/local/lib/mcpg/plugins/")),
-            "entries load the image-baked artifacts"
+                .starts_with("ghcr.io/mcpg-dev/plugins/")),
+            "entries fetch from the public plugin registry"
         );
     }
 

@@ -629,6 +629,16 @@ fn build_env_vars() -> Vec<EnvVar> {
             }),
             ..Default::default()
         },
+        // Plugins are fetched from OCI at boot and cached on disk. The
+        // rootfs is read-only, so without this the cache resolves under
+        // `$HOME` and the first pull fails creating it — which fails boot,
+        // because OCI resolution is fail-closed. `RUNTIME_DIR` is the one
+        // writable path. An explicit `plugin_registry.cache_dir` still wins.
+        EnvVar {
+            name: "XDG_CACHE_HOME".to_owned(),
+            value: Some(format!("{RUNTIME_DIR}/cache")),
+            ..Default::default()
+        },
     ]
 }
 
@@ -1093,10 +1103,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             image,
-            format!(
-                "ghcr.io/mcpg-dev/source-code/gateway:{}",
-                crate::DEFAULT_GATEWAY_IMAGE_TAG
-            )
+            format!("ghcr.io/mcpg-dev/mcpg:{}", crate::DEFAULT_GATEWAY_IMAGE_TAG)
         );
     }
 

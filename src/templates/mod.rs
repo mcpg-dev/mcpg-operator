@@ -33,7 +33,7 @@ pub use managed_nats::{
 };
 pub use pdb::build_pdb;
 pub use plugin_render::{
-    CLOUD_PLUGIN_IMAGE_ROOT, REVOCATION_LIST_MOUNT_PATH, ResolvedSetEntry, ResolvedSetView,
+    CLOUD_PLUGIN_OCI_BASE, REVOCATION_LIST_MOUNT_PATH, ResolvedSetEntry, ResolvedSetView,
     append_cloud_default_plugins, append_observability_sink_plugins, cloud_default_plugin_ids,
     merge_plugins,
 };

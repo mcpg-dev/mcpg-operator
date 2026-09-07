@@ -54,7 +54,7 @@ pub const FIELD_MANAGER_PREFIX: &str = "mcpg-operator";
 /// [`ENV_DEFAULT_GATEWAY_IMAGE_REPOSITORY`] is unset. Call
 /// [`default_gateway_image_repository`] rather than reading this
 /// directly — the accessor layers the runtime override on top.
-pub const DEFAULT_GATEWAY_IMAGE_REPOSITORY: &str = "ghcr.io/mcpg-dev/source-code/gateway";
+pub const DEFAULT_GATEWAY_IMAGE_REPOSITORY: &str = "ghcr.io/mcpg-dev/mcpg";
 
 /// Runtime override for the default gateway image repository. Read once
 /// from the operator's environment on first use.
@@ -180,7 +180,7 @@ mod image_default_tests {
                     ENV_DEFAULT_GATEWAY_IMAGE_REPOSITORY,
                     DEFAULT_GATEWAY_IMAGE_REPOSITORY
                 ),
-                "ghcr.io/mcpg-dev/source-code/gateway"
+                "ghcr.io/mcpg-dev/mcpg"
             );
         });
         temp_env::with_var_unset(ENV_DEFAULT_GATEWAY_IMAGE_TAG, || {

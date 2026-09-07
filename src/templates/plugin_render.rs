@@ -85,20 +85,33 @@ const PLUGIN_MOUNT_ROOT: &str = "/etc/mcpg/plugins";
 /// Where the operator projects the active revocation list.
 pub const REVOCATION_LIST_MOUNT_PATH: &str = "/etc/mcpg/revocations/list.json";
 
-/// Directory inside the published gateway images where the standard
-/// first-party backend cdylibs are baked: `<id>/plugin.so` plus the
-/// optional capability sidecar `<id>/plugin.so.plugin.yaml` (the
-/// gateway's raw-`.so` loader probes `<artifact-path>.plugin.yaml`).
-/// The managed-cloud default entries rendered by
-/// [`append_cloud_default_plugins`] point here. These paths only
-/// resolve on the stock gateway images — a missing `source.path`
-/// artifact fails gateway boot — which is why the entries are
-/// rendered for cloud CRs only (a self-host CR may run any image).
-pub const CLOUD_PLUGIN_IMAGE_ROOT: &str = "/usr/local/lib/mcpg/plugins";
+/// Registry the managed-cloud default entries pull from. Plugins are not
+/// bundled with the gateway image, so a default entry names an OCI
+/// repository and the runtime fetches, verifies and caches it.
+///
+/// The reference is deliberately tag-less and platform-agnostic: the gateway
+/// expands it to `:protocol-<major>-<os>[-musl]-<arch>`, so a managed instance
+/// tracks the protocol its own binary speaks rather than a version the
+/// operator guessed. Asserted against `tools/release/oci-registry.json` by
+/// `tools/ci/selftest-oci-registry.sh`.
+pub const CLOUD_PLUGIN_OCI_BASE: &str = "ghcr.io/mcpg-dev/plugins";
 
-/// The standard backend plugins every managed-cloud gateway carries by
-/// default: the generic protocol backends baked into the published
-/// gateway images. Each id is paired with the capability grants its
+/// A first-party plugin's registry repository name: the dotted id without its
+/// `dev.mcpg.` prefix, hyphenated (`dev.mcpg.backend.http` → `backend-http`).
+/// The gateway accepts the dotted id too, but emitting the published spelling
+/// keeps the rendered CR honest about what will be pulled.
+fn plugin_repo_name(id: &str) -> String {
+    id.strip_prefix("dev.mcpg.").unwrap_or(id).replace('.', "-")
+}
+
+/// OCI reference for a first-party plugin id.
+fn plugin_oci_ref(id: &str) -> String {
+    format!("{CLOUD_PLUGIN_OCI_BASE}/{}", plugin_repo_name(id))
+}
+
+/// The standard backend plugins every managed-cloud gateway is given by
+/// default: the generic protocol backends, fetched from the public plugin
+/// registry at boot. Each id is paired with the capability grants its
 /// descriptor declares as required — host-service calls are filtered
 /// per-alias fail-closed, so an under-granted entry would load but be
 /// denied at dispatch (e.g. `cred://` resolution inside a binding).
@@ -311,7 +324,7 @@ pub fn append_observability_sink_plugins(config: &mut Value) {
                 "id": id,
                 "kind": "native",
                 "class": class,
-                "source": { "path": format!("{CLOUD_PLUGIN_IMAGE_ROOT}/{id}/plugin.so") },
+                "source": { "oci": plugin_oci_ref(id) },
             }),
         );
     }
@@ -359,7 +372,7 @@ fn render_cloud_default_entry(id: &str) -> Value {
         "kind": "native",
         "class": "backend",
         "source": {
-            "path": format!("{CLOUD_PLUGIN_IMAGE_ROOT}/{id}/plugin.so"),
+            "oci": plugin_oci_ref(id),
         },
     });
     let grants: &[&str] = CLOUD_DEFAULT_BACKEND_PLUGINS
@@ -848,8 +861,8 @@ mod tests {
         assert_eq!(http["kind"], "native");
         assert_eq!(http["class"], "backend");
         assert_eq!(
-            http["source"]["path"],
-            "/usr/local/lib/mcpg/plugins/dev.mcpg.backend.http/plugin.so"
+            http["source"]["oci"],
+            "ghcr.io/mcpg-dev/plugins/backend-http"
         );
         assert_eq!(http["granted_capabilities"], json!(["network_outbound"]));
         // No-required-capability plugins omit the field so the
@@ -959,9 +972,11 @@ mod tests {
         let mut config = json!({});
         append_cloud_default_plugins(&mut config, &["com.acme.backend.custom".to_owned()]);
         let entry = &config["plugins"][0];
+        // A third-party id has no `dev.mcpg.` prefix to strip, so it is
+        // used verbatim as the repository segment.
         assert_eq!(
-            entry["source"]["path"],
-            "/usr/local/lib/mcpg/plugins/com.acme.backend.custom/plugin.so"
+            entry["source"]["oci"],
+            "ghcr.io/mcpg-dev/plugins/com-acme-backend-custom"
         );
         assert!(entry.get("granted_capabilities").is_none());
     }
@@ -995,8 +1010,8 @@ mod tests {
         assert_eq!(http.kind, "native");
         assert_eq!(http.class, "backend");
         assert_eq!(
-            http.source.path.as_deref(),
-            Some("/usr/local/lib/mcpg/plugins/dev.mcpg.backend.http/plugin.so")
+            http.source.oci.as_deref(),
+            Some("ghcr.io/mcpg-dev/plugins/backend-http")
         );
         assert_eq!(http.granted_capabilities.len(), 1);
         // The typed gateway validator must also pass (alias uniqueness,
@@ -1028,8 +1043,8 @@ mod tests {
             .expect("sink plugin entry present");
         assert_eq!(sink.class, "metrics_sink");
         assert_eq!(
-            sink.source.path.as_deref(),
-            Some("/usr/local/lib/mcpg/plugins/dev.mcpg.observability.prometheus/plugin.so")
+            sink.source.oci.as_deref(),
+            Some("ghcr.io/mcpg-dev/plugins/observability-prometheus")
         );
         mcpg::config::validate_plugins(&cfg.plugins)
             .expect("rendered sink entry must pass the gateway's plugins[] validator");
