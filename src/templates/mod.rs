@@ -24,7 +24,7 @@ mod service_account;
 
 pub use common::{child_name, owner_ref, selector_labels, standard_labels};
 pub use configmap::build_configmap;
-pub use deployment::{PluginSecretMount, RevocationListMount, build_deployment};
+pub use deployment::{PLUGIN_CACHE_DIR, PluginSecretMount, RevocationListMount, build_deployment};
 pub use hpa::build_hpa;
 pub use httproute::{HTTPRoute, build_httproute};
 pub use managed_nats::{

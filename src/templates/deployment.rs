@@ -53,6 +53,12 @@ const REVOCATION_LIST_MOUNT_DIR: &str = "/etc/mcpg/revocations";
 /// process can write — the container's working directory is anchored to
 /// it so relative runtime writes (the default audit log) land here.
 const RUNTIME_DIR: &str = "/var/lib/mcpg";
+
+/// Where fetched plugins are cached and unpacked. Under [`RUNTIME_DIR`]
+/// because it must be writable AND executable: the unpacked `.so` is
+/// dlopen'd from here, so a `noexec` mount fails the load with an error
+/// naming dlopen rather than the mount.
+pub const PLUGIN_CACHE_DIR: &str = "/var/lib/mcpg/plugin-cache";
 /// Volume name for [`RUNTIME_DIR`].
 const RUNTIME_VOLUME_NAME: &str = "runtime";
 

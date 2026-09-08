@@ -2012,6 +2012,16 @@ fn apply_cloud_default_plugins(
     if obj.spec.cloud.is_none() {
         return;
     }
+    // Plugins are fetched, and a fetched plugin is UNPACKED before it is
+    // dlopen'd. Both caches have to land on the one writable path a tenant pod
+    // has. `cache_dir` is the only setting that moves BOTH — the pull cache
+    // also honours `XDG_CACHE_HOME`, but the unpack cache does not and falls
+    // back to the temp dir, which is on the read-only rootfs. Without this a
+    // plugin pulls and verifies cleanly and then dies at dlopen.
+    crate::templates::plugin_render::set_plugin_cache_dir(
+        merged_config,
+        crate::templates::PLUGIN_CACHE_DIR,
+    );
     append_cloud_default_plugins(merged_config, &cloud_default_plugin_ids(override_csv));
     // BEFORE the sink pass below: the injected traces block is what makes it
     // append the otlp plugin's loader entry.
@@ -2183,6 +2193,40 @@ mod tests {
                 .unwrap()
                 .starts_with("ghcr.io/mcpg-dev/plugins/")),
             "entries fetch from the public plugin registry"
+        );
+    }
+
+    /// A fetched plugin is UNPACKED before it is dlopen'd, and the unpack
+    /// cache honours only `cache_dir` — not `XDG_CACHE_HOME` — falling back to
+    /// the temp dir, which sits on the read-only rootfs. Without this the
+    /// plugin pulls and verifies cleanly and then dies at dlopen, naming a
+    /// path nobody configured.
+    #[test]
+    fn cloud_cr_points_the_plugin_cache_at_the_writable_volume() {
+        let gw = gw_cloudness(true);
+        let mut cfg = serde_json::json!({});
+        apply_cloud_default_plugins(&gw, None, None, &mut cfg);
+        assert_eq!(
+            cfg["gateway"]["plugin_registry"]["cache_dir"].as_str(),
+            Some(crate::templates::PLUGIN_CACHE_DIR),
+        );
+        assert!(
+            crate::templates::PLUGIN_CACHE_DIR.starts_with("/var/lib/mcpg"),
+            "the cache must live under the writable runtime volume"
+        );
+    }
+
+    /// A tenant that set its own path knows where its writable mounts are.
+    #[test]
+    fn an_explicit_plugin_cache_dir_is_not_overridden() {
+        let gw = gw_cloudness(true);
+        let mut cfg = serde_json::json!({
+            "gateway": { "plugin_registry": { "cache_dir": "/mnt/scratch" } }
+        });
+        apply_cloud_default_plugins(&gw, None, None, &mut cfg);
+        assert_eq!(
+            cfg["gateway"]["plugin_registry"]["cache_dir"].as_str(),
+            Some("/mnt/scratch")
         );
     }
 

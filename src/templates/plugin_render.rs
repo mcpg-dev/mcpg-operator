@@ -456,6 +456,22 @@ pub fn merge_plugins(
     config
 }
 
+/// Point `gateway.plugin_registry.cache_dir` at a writable path.
+///
+/// One setting, two caches: the OCI download lands in `<dir>/oci` and the
+/// unpacked artefact in `<dir>/unpack`. Only this field moves both — the
+/// download cache also reads `XDG_CACHE_HOME`, the unpack cache does not.
+pub fn set_plugin_cache_dir(config: &mut Value, dir: &str) {
+    let gateway = ensure_object(config, "gateway");
+    let registry = ensure_object(gateway, "plugin_registry");
+    let obj = registry
+        .as_object_mut()
+        .expect("ensure_object always returns an object");
+    // A tenant that set its own path knows where its writable mounts are.
+    obj.entry("cache_dir")
+        .or_insert_with(|| Value::String(dir.to_owned()));
+}
+
 /// Render one resolved entry into the gateway's
 /// `PluginEntryConfig` JSON shape. The gateway daemon's serde
 /// definition lives in `apps/gateway/src/config/plugins.rs`.
