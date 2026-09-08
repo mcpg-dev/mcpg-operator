@@ -2216,6 +2216,29 @@ mod tests {
         );
     }
 
+    /// The property the pin exists for: no rendered plugin reference may be
+    /// left unpinned. An unpinned ref resolves to the floating protocol tag,
+    /// and the bytes running in a tenant's gateway process then change with no
+    /// config change, no diff and no rollback point — two replicas restarting
+    /// at different times can run different code.
+    #[test]
+    fn no_rendered_plugin_reference_floats() {
+        let gw = gw_cloudness(true);
+        let mut cfg = serde_json::json!({});
+        apply_cloud_default_plugins(&gw, None, None, &mut cfg);
+        let entries = cfg["plugins"].as_array().expect("plugins array rendered");
+        assert!(!entries.is_empty());
+        for e in entries {
+            let oci = e["source"]["oci"].as_str().expect("entry fetches from OCI");
+            // A tag lives after the last `/`; a registry port does not.
+            let leaf = oci.rsplit('/').next().unwrap_or(oci);
+            assert!(
+                leaf.contains(':') || oci.contains("@sha256:"),
+                "unpinned plugin reference `{oci}` — it would track a floating tag"
+            );
+        }
+    }
+
     /// A tenant that set its own path knows where its writable mounts are.
     #[test]
     fn an_explicit_plugin_cache_dir_is_not_overridden() {

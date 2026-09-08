@@ -639,7 +639,7 @@ fn build_env_vars() -> Vec<EnvVar> {
         // rootfs is read-only, so without this the cache resolves under
         // `$HOME` and the first pull fails creating it — which fails boot,
         // because OCI resolution is fail-closed. `RUNTIME_DIR` is the one
-        // writable path. An explicit `plugin_registry.cache_dir` still wins.
+        // writable path. An explicit `gateway.plugin_registry.cache_dir` still wins.
         EnvVar {
             name: "XDG_CACHE_HOME".to_owned(),
             value: Some(format!("{RUNTIME_DIR}/cache")),

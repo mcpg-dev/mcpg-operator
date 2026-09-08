@@ -104,9 +104,22 @@ fn plugin_repo_name(id: &str) -> String {
     id.strip_prefix("dev.mcpg.").unwrap_or(id).replace('.', "-")
 }
 
-/// OCI reference for a first-party plugin id.
+/// OCI reference for a first-party plugin id, pinned to the platform's
+/// plugin version.
+///
+/// The version is a TAG, not a digest, and the reference carries no platform
+/// suffix: the gateway appends its own `-<os>[-musl]-<arch>` at boot, because
+/// it is the only party that knows its libc. Pinning the version is what stops
+/// the bytes in a tenant's gateway process changing without a config change;
+/// pinning a digest would additionally require the operator to guess which
+/// platform's artefact the tenant will want, and a wrong guess is a refusal
+/// at load.
 fn plugin_oci_ref(id: &str) -> String {
-    format!("{CLOUD_PLUGIN_OCI_BASE}/{}", plugin_repo_name(id))
+    format!(
+        "{CLOUD_PLUGIN_OCI_BASE}/{}:{}",
+        plugin_repo_name(id),
+        crate::default_plugin_version()
+    )
 }
 
 /// The standard backend plugins every managed-cloud gateway is given by
@@ -878,7 +891,7 @@ mod tests {
         assert_eq!(http["class"], "backend");
         assert_eq!(
             http["source"]["oci"],
-            "ghcr.io/mcpg-dev/plugins/backend-http"
+            "ghcr.io/mcpg-dev/plugins/backend-http:protocol-1"
         );
         assert_eq!(http["granted_capabilities"], json!(["network_outbound"]));
         // No-required-capability plugins omit the field so the
@@ -992,7 +1005,7 @@ mod tests {
         // used verbatim as the repository segment.
         assert_eq!(
             entry["source"]["oci"],
-            "ghcr.io/mcpg-dev/plugins/com-acme-backend-custom"
+            "ghcr.io/mcpg-dev/plugins/com-acme-backend-custom:protocol-1"
         );
         assert!(entry.get("granted_capabilities").is_none());
     }
@@ -1027,7 +1040,7 @@ mod tests {
         assert_eq!(http.class, "backend");
         assert_eq!(
             http.source.oci.as_deref(),
-            Some("ghcr.io/mcpg-dev/plugins/backend-http")
+            Some("ghcr.io/mcpg-dev/plugins/backend-http:protocol-1")
         );
         assert_eq!(http.granted_capabilities.len(), 1);
         // The typed gateway validator must also pass (alias uniqueness,
@@ -1060,7 +1073,7 @@ mod tests {
         assert_eq!(sink.class, "metrics_sink");
         assert_eq!(
             sink.source.oci.as_deref(),
-            Some("ghcr.io/mcpg-dev/plugins/observability-prometheus")
+            Some("ghcr.io/mcpg-dev/plugins/observability-prometheus:protocol-1")
         );
         mcpg::config::validate_plugins(&cfg.plugins)
             .expect("rendered sink entry must pass the gateway's plugins[] validator");

@@ -79,6 +79,43 @@ pub const DEFAULT_GATEWAY_IMAGE_TAG: &str = match option_env!("MCPG_OPERATOR_DEF
 /// release artifact ships with when this is unset.
 pub const ENV_DEFAULT_GATEWAY_IMAGE_TAG: &str = "MCPG_DEFAULT_GATEWAY_IMAGE_TAG";
 
+/// Compile-time pin for the plugin version managed-cloud gateways load.
+///
+/// A tenant's plugins are named in its config and fetched at boot, so an
+/// UNPINNED reference resolves to the floating `protocol-<major>` tag — and
+/// the bytes running in a tenant's gateway process then change with no config
+/// change, no diff and no rollback point. Two replicas restarting at
+/// different times can run different code.
+///
+/// Pinning a version makes a plugin change an act rather than a drift. The
+/// platform owns that act: the release pipeline overrides this the way it
+/// does the gateway tag, so an operator build ships pinned to the plugin
+/// versions it was released beside.
+///
+/// It is a VERSION, not a digest, deliberately. Plugin artefacts are
+/// published per platform, so a digest identifies one platform's build; the
+/// gateway appends its own `-<os>[-musl]-<arch>` suffix at boot and only it
+/// knows its libc. A version tag lets the platform pin what it controls
+/// without guessing what the tenant's binary is. Digest pinning wants a
+/// multi-platform index first.
+pub const DEFAULT_PLUGIN_VERSION: &str = match option_env!("MCPG_OPERATOR_DEFAULT_PLUGIN_VERSION") {
+    Some(v) => v,
+    None => "protocol-1",
+};
+
+/// Runtime override for [`DEFAULT_PLUGIN_VERSION`].
+pub const ENV_DEFAULT_PLUGIN_VERSION: &str = "MCPG_DEFAULT_PLUGIN_VERSION";
+
+static RESOLVED_PLUGIN_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Effective plugin version: [`ENV_DEFAULT_PLUGIN_VERSION`] when set
+/// non-blank, else the [`DEFAULT_PLUGIN_VERSION`] build pin.
+pub fn default_plugin_version() -> &'static str {
+    RESOLVED_PLUGIN_VERSION
+        .get_or_init(|| resolve_image_default(ENV_DEFAULT_PLUGIN_VERSION, DEFAULT_PLUGIN_VERSION))
+        .as_str()
+}
+
 static RESOLVED_GATEWAY_IMAGE_REPOSITORY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static RESOLVED_GATEWAY_IMAGE_TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
