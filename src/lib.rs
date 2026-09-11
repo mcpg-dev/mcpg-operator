@@ -79,18 +79,25 @@ pub const DEFAULT_GATEWAY_IMAGE_TAG: &str = match option_env!("MCPG_OPERATOR_DEF
 /// release artifact ships with when this is unset.
 pub const ENV_DEFAULT_GATEWAY_IMAGE_TAG: &str = "MCPG_DEFAULT_GATEWAY_IMAGE_TAG";
 
-/// Compile-time pin for the plugin version managed-cloud gateways load.
+/// Compile-time default for the plugin version managed-cloud gateways load.
+/// Call [`default_plugin_version`] rather than reading this directly — the
+/// accessor layers the runtime override on top.
 ///
-/// A tenant's plugins are named in its config and fetched at boot, so an
-/// UNPINNED reference resolves to the floating `protocol-<major>` tag — and
-/// the bytes running in a tenant's gateway process then change with no config
-/// change, no diff and no rollback point. Two replicas restarting at
-/// different times can run different code.
+/// A tenant's plugins are named in its config and fetched from OCI at boot,
+/// so the tag rendered here decides which bytes a gateway process runs. A
+/// concrete released version makes a plugin change an act rather than a
+/// drift: two replicas restarting at different times cannot then run
+/// different code.
 ///
-/// Pinning a version makes a plugin change an act rather than a drift. The
-/// platform owns that act: the release pipeline overrides this the way it
-/// does the gateway tag, so an operator build ships pinned to the plugin
-/// versions it was released beside.
+/// The fallback is not such a version. `protocol-1` is the floating protocol
+/// tag: the gateway appends its own platform suffix and lands on
+/// `:protocol-1-<os>[-musl]-<arch>` — the same artifact a TAG-LESS ref
+/// resolves to — and CD re-points that tag at every plugin publish. The
+/// release pipeline is where that act belongs: setting
+/// `MCPG_OPERATOR_DEFAULT_PLUGIN_VERSION` at build time pins an operator to
+/// the plugin versions it is released beside, the same `option_env!` build
+/// pin [`DEFAULT_GATEWAY_IMAGE_TAG`] carries. No release job sets it today,
+/// so a released operator renders the floating tag above.
 ///
 /// It is a VERSION, not a digest, deliberately. Plugin artefacts are
 /// published per platform, so a digest identifies one platform's build; the

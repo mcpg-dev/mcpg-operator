@@ -2216,13 +2216,14 @@ mod tests {
         );
     }
 
-    /// The property the pin exists for: no rendered plugin reference may be
-    /// left unpinned. An unpinned ref resolves to the floating protocol tag,
-    /// and the bytes running in a tenant's gateway process then change with no
-    /// config change, no diff and no rollback point — two replicas restarting
-    /// at different times can run different code.
+    /// Every rendered plugin reference carries a tag (or digest) rather than
+    /// being left bare, so the operator's plugin version is what a managed
+    /// gateway pulls. This asserts that shape, not the absence of drift:
+    /// with the built-in `protocol-1` default the rendered ref expands to the
+    /// same `:protocol-1-<os>-<arch>` artifact a tag-less ref would, so the
+    /// bytes move only once `default_plugin_version()` names a real version.
     #[test]
-    fn no_rendered_plugin_reference_floats() {
+    fn every_rendered_plugin_reference_carries_a_tag_or_digest() {
         let gw = gw_cloudness(true);
         let mut cfg = serde_json::json!({});
         apply_cloud_default_plugins(&gw, None, None, &mut cfg);
@@ -2234,7 +2235,7 @@ mod tests {
             let leaf = oci.rsplit('/').next().unwrap_or(oci);
             assert!(
                 leaf.contains(':') || oci.contains("@sha256:"),
-                "unpinned plugin reference `{oci}` — it would track a floating tag"
+                "plugin reference `{oci}` carries no tag or digest — the plugin version has nothing to land on"
             );
         }
     }

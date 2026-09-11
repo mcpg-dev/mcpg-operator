@@ -89,10 +89,13 @@ pub const REVOCATION_LIST_MOUNT_PATH: &str = "/etc/mcpg/revocations/list.json";
 /// bundled with the gateway image, so a default entry names an OCI
 /// repository and the runtime fetches, verifies and caches it.
 ///
-/// The reference is deliberately tag-less and platform-agnostic: the gateway
-/// expands it to `:protocol-<major>-<os>[-musl]-<arch>`, so a managed instance
-/// tracks the protocol its own binary speaks rather than a version the
-/// operator guessed. Asserted against `tools/release/oci-registry.json` by
+/// The base carries no tag: `plugin_oci_ref` appends the platform's plugin
+/// version (`crate::default_plugin_version()`, `protocol-1` by default) and
+/// never a platform suffix. The gateway appends that itself at boot —
+/// `:protocol-1` → `:protocol-1-linux-amd64`, falling back to `-wasi-wasm` —
+/// because it is the only party that knows its os/arch/libc, so a managed
+/// instance pulls the artefact its own binary can `dlopen`. The base string
+/// is asserted against `tools/release/oci-registry.json` by
 /// `tools/ci/selftest-oci-registry.sh`.
 pub const CLOUD_PLUGIN_OCI_BASE: &str = "ghcr.io/mcpg-dev/plugins";
 
@@ -104,16 +107,22 @@ fn plugin_repo_name(id: &str) -> String {
     id.strip_prefix("dev.mcpg.").unwrap_or(id).replace('.', "-")
 }
 
-/// OCI reference for a first-party plugin id, pinned to the platform's
-/// plugin version.
+/// OCI reference for a first-party plugin id at the operator's default plugin
+/// version ([`crate::default_plugin_version`]).
 ///
 /// The version is a TAG, not a digest, and the reference carries no platform
 /// suffix: the gateway appends its own `-<os>[-musl]-<arch>` at boot, because
-/// it is the only party that knows its libc. Pinning the version is what stops
-/// the bytes in a tenant's gateway process changing without a config change;
-/// pinning a digest would additionally require the operator to guess which
-/// platform's artefact the tenant will want, and a wrong guess is a refusal
-/// at load.
+/// it is the only party that knows its libc. A digest would instead force the
+/// operator to guess which platform's artefact the tenant will want, and a
+/// wrong guess is a refusal at load.
+///
+/// Only a concrete released version in that tag stops the bytes in a tenant's
+/// gateway process changing without a config change. The built-in
+/// `protocol-1` default resolves to the platform's floating protocol tag,
+/// which the plugin publish re-points on every release, so an install that
+/// wants that property sets the version itself —
+/// `MCPG_OPERATOR_DEFAULT_PLUGIN_VERSION` at build time, or
+/// `MCPG_DEFAULT_PLUGIN_VERSION` in the operator's environment.
 fn plugin_oci_ref(id: &str) -> String {
     format!(
         "{CLOUD_PLUGIN_OCI_BASE}/{}:{}",
@@ -220,9 +229,18 @@ pub fn append_cloud_default_plugins(config: &mut Value, ids: &[String]) {
 /// entry. Without one the signal is configured, the gateway boots, nothing
 /// objects, and the metrics are simply never exported — visible only as one
 /// WARN at startup.
-const BAKED_SINK_PLUGINS: &[(&str, &str)] = &[
-    ("dev.mcpg.observability.prometheus", "metrics_sink"),
-    ("dev.mcpg.observability.otlp", "telemetry_sink"),
+/// Each entry carries the grants its descriptor declares under
+/// `required_capabilities`. A sink appended without them loads no differently
+/// from one that was never appended — the host refuses an under-granted plugin
+/// at boot, so the gateway does not start at all rather than starting without
+/// telemetry.
+const BAKED_SINK_PLUGINS: &[(&str, &str, &[&str])] = &[
+    ("dev.mcpg.observability.prometheus", "metrics_sink", &[]),
+    (
+        "dev.mcpg.observability.otlp",
+        "telemetry_sink",
+        &["network_outbound"],
+    ),
 ];
 
 /// Give a cloud gateway a default traces pipeline when its author declared
@@ -312,34 +330,35 @@ fn configured_sink_kinds(config: &Value) -> Vec<String> {
 /// third-party sink stays the config author's responsibility — the operator
 /// cannot know where its cdylib lives.
 pub fn append_observability_sink_plugins(config: &mut Value) {
-    let wanted: Vec<(&str, &str)> = configured_sink_kinds(config)
+    let wanted: Vec<(&str, &str, &[&str])> = configured_sink_kinds(config)
         .into_iter()
         .filter_map(|kind| {
             BAKED_SINK_PLUGINS
                 .iter()
-                .find(|(id, _)| *id == kind)
+                .find(|(id, _, _)| *id == kind)
                 .copied()
         })
         .collect();
     if wanted.is_empty() {
         return;
     }
-    for (id, class) in wanted {
+    for (id, class, grants) in wanted {
         // Re-read the taken set each time: a duplicate plugin id registers a
         // duplicate alias and fails boot, which is worse than the missing
         // signal this exists to fix.
         if plugin_ids(config).contains(id) {
             continue;
         }
-        push_plugin_entry(
-            config,
-            json!({
-                "id": id,
-                "kind": "native",
-                "class": class,
-                "source": { "oci": plugin_oci_ref(id) },
-            }),
-        );
+        let mut entry = json!({
+            "id": id,
+            "kind": "native",
+            "class": class,
+            "source": { "oci": plugin_oci_ref(id) },
+        });
+        if !grants.is_empty() {
+            entry["granted_capabilities"] = json!(grants);
+        }
+        push_plugin_entry(config, entry);
     }
 }
 
@@ -1133,6 +1152,20 @@ mod tests {
         assert!(
             plugin_ids(&config).contains("dev.mcpg.observability.otlp"),
             "injected traces sink must get its loader entry"
+        );
+        // ...carrying the capability its descriptor requires. Without it the
+        // host refuses the plugin and the gateway does not boot, so injecting
+        // the sink would take the whole tenant down rather than lose telemetry.
+        let otlp = config["plugins"]
+            .as_array()
+            .expect("plugins array")
+            .iter()
+            .find(|e| e["id"] == "dev.mcpg.observability.otlp")
+            .expect("otlp entry");
+        assert_eq!(
+            otlp["granted_capabilities"],
+            serde_json::json!(["network_outbound"]),
+            "otlp declares required_capabilities: [network_outbound]"
         );
         // and the whole thing must still be a valid gateway config
         let parsed: Result<mcpg::config::AppConfig, _> = serde_json::from_value(config.clone());

@@ -121,7 +121,7 @@ metadata:
 spec:
   replicas: 1
   image:
-    repository: ghcr.io/mcpg-dev/source-code/gateway
+    repository: ghcr.io/mcpg-dev/mcpg
   config:
     gateway:
       server:
