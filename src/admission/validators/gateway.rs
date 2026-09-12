@@ -135,6 +135,34 @@ fn validate_spec(obj: &MCPGGateway) -> Result<(), String> {
         }
     }
 
+    // Mounted Secrets: each entry becomes one pod volume + one container
+    // mount, so a repeated name or path would fail the Deployment apply
+    // after admission instead of the CR write.
+    let mut mounted_secrets = std::collections::BTreeSet::new();
+    let mut mount_paths = std::collections::BTreeSet::new();
+    for (i, m) in spec.secret_mounts.iter().enumerate() {
+        if m.name.trim().is_empty() {
+            return Err(format!("spec.secretMounts[{i}].name must not be empty"));
+        }
+        if !m.mount_path.starts_with('/') {
+            return Err(format!(
+                "spec.secretMounts[{i}].mountPath must be an absolute path"
+            ));
+        }
+        if !mounted_secrets.insert(m.name.as_str()) {
+            return Err(format!(
+                "spec.secretMounts[{i}].name repeats an earlier entry ({})",
+                m.name
+            ));
+        }
+        if !mount_paths.insert(m.mount_path.trim_end_matches('/')) {
+            return Err(format!(
+                "spec.secretMounts[{i}].mountPath repeats an earlier entry ({})",
+                m.mount_path
+            ));
+        }
+    }
+
     // Ingress hosts must be non-empty when ingress is set.
     if let Some(ing) = &spec.ingress {
         if ing.ingress_class_name.trim().is_empty() {
@@ -381,6 +409,7 @@ fn validate_dns_hostname(s: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use kube::core::ObjectMeta;
+    use mcpg_operator_api::v1alpha1::gateway::SecretMount;
     use mcpg_operator_api::v1alpha1::{
         AwsWorkloadIdentity, GatewayImage, GatewayIngress, GatewayIngressHost, GatewayIngressPath,
         GatewayWorkloadIdentity, GcpWorkloadIdentity, MCPGGatewaySpec,
@@ -540,6 +569,68 @@ mod tests {
             ..valid_spec()
         };
         validate_spec(&fixture(s)).unwrap();
+    }
+
+    fn secret_mount(name: &str, mount_path: &str) -> SecretMount {
+        SecretMount {
+            name: name.into(),
+            mount_path: mount_path.into(),
+        }
+    }
+
+    #[test]
+    fn accepts_well_formed_secret_mounts() {
+        let s = MCPGGatewaySpec {
+            secret_mounts: vec![
+                secret_mount("mcpg-tenant-secrets", "/var/run/mcpg/secrets"),
+                secret_mount("gateway-tls", "/etc/mcpg/tls"),
+            ],
+            ..valid_spec()
+        };
+        validate_spec(&fixture(s)).unwrap();
+    }
+
+    #[test]
+    fn rejects_secret_mount_with_empty_name() {
+        let s = MCPGGatewaySpec {
+            secret_mounts: vec![secret_mount(" ", "/var/run/mcpg/secrets")],
+            ..valid_spec()
+        };
+        let err = validate_spec(&fixture(s)).unwrap_err();
+        assert!(err.contains("secretMounts[0].name"), "{err}");
+    }
+
+    #[test]
+    fn rejects_secret_mount_with_relative_path() {
+        let s = MCPGGatewaySpec {
+            secret_mounts: vec![secret_mount("mcpg-tenant-secrets", "secrets")],
+            ..valid_spec()
+        };
+        let err = validate_spec(&fixture(s)).unwrap_err();
+        assert!(err.contains("secretMounts[0].mountPath"), "{err}");
+    }
+
+    #[test]
+    fn rejects_repeated_secret_mount_name_or_path() {
+        let s = MCPGGatewaySpec {
+            secret_mounts: vec![
+                secret_mount("mcpg-tenant-secrets", "/var/run/mcpg/secrets"),
+                secret_mount("mcpg-tenant-secrets", "/etc/mcpg/tls"),
+            ],
+            ..valid_spec()
+        };
+        let err = validate_spec(&fixture(s)).unwrap_err();
+        assert!(err.contains("secretMounts[1].name"), "{err}");
+
+        let s = MCPGGatewaySpec {
+            secret_mounts: vec![
+                secret_mount("mcpg-tenant-secrets", "/var/run/mcpg/secrets"),
+                secret_mount("gateway-tls", "/var/run/mcpg/secrets/"),
+            ],
+            ..valid_spec()
+        };
+        let err = validate_spec(&fixture(s)).unwrap_err();
+        assert!(err.contains("secretMounts[1].mountPath"), "{err}");
     }
 
     fn valid_cloud() -> GatewayCloud {

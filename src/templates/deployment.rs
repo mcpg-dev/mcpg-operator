@@ -19,6 +19,7 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::core::ObjectMeta;
+use mcpg_operator_api::v1alpha1::gateway::SecretMount;
 use mcpg_operator_api::v1alpha1::{GatewayProbe, MCPGGateway};
 
 use crate::templates::common::{child_name, owner_ref, selector_labels, standard_labels};
@@ -382,18 +383,39 @@ fn build_volumes(
         });
     }
 
+    for m in &parent.spec.secret_mounts {
+        volumes.push(Volume {
+            name: secret_volume_name(&m.name),
+            secret: Some(SecretVolumeSource {
+                secret_name: Some(m.name.clone()),
+                // Readable through fsGroup 65534, never executable.
+                default_mode: Some(0o440),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+
     volumes
 }
 
 /// Sanitise a plugin id (reverse-domain, dots) into a K8s volume
-/// name (lowercase alphanumeric / `-`, ≤63 chars). The gateway
-/// reads bytes by mount path, so the volume name itself only
-/// has to round-trip K8s validation.
+/// name. The gateway reads bytes by mount path, so the volume name
+/// itself only has to round-trip K8s validation.
 fn plugin_volume_name(plugin_id: &str) -> String {
-    // Replace any non-alphanumeric with `-`. K8s volume names are
-    // RFC1123 — lowercase alphanumeric + `-`, ≤63 chars, must
-    // begin + end with an alphanumeric.
-    let mut s: String = plugin_id
+    volume_name("plugin", plugin_id)
+}
+
+/// Volume name for a `spec.secretMounts` entry — the Secret name is a
+/// DNS subdomain (dots allowed), a volume name is not.
+fn secret_volume_name(secret_name: &str) -> String {
+    volume_name("secret", secret_name)
+}
+
+/// `<prefix>-<raw>` as a K8s volume name: RFC1123 — lowercase
+/// alphanumeric + `-`, ≤63 chars, begins + ends with an alphanumeric.
+fn volume_name(prefix: &str, raw: &str) -> String {
+    let mut s: String = raw
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() {
@@ -407,7 +429,7 @@ fn plugin_volume_name(plugin_id: &str) -> String {
         s.truncate(56);
     }
     let cleaned = s.trim_matches('-').to_owned();
-    let prefixed = format!("plugin-{cleaned}");
+    let prefixed = format!("{prefix}-{cleaned}");
     if prefixed.len() > 63 {
         prefixed[..63].to_owned()
     } else {
@@ -464,7 +486,11 @@ fn build_main_container(
         env: Some(build_env_vars()),
         env_from: build_env_from(parent, extra_env_from_secrets),
         resources: Some(build_resources(parent)),
-        volume_mounts: Some(build_volume_mounts(plugin_mounts, revocation_list)),
+        volume_mounts: Some(build_volume_mounts(
+            plugin_mounts,
+            revocation_list,
+            &parent.spec.secret_mounts,
+        )),
         liveness_probe: Some(build_probe(
             parent
                 .spec
@@ -521,6 +547,7 @@ fn build_main_container(
 fn build_volume_mounts(
     plugin_mounts: &[PluginSecretMount],
     revocation_list: Option<&RevocationListMount>,
+    secret_mounts: &[SecretMount],
 ) -> Vec<VolumeMount> {
     let mut mounts = vec![VolumeMount {
         name: "config".to_owned(),
@@ -560,6 +587,16 @@ fn build_volume_mounts(
         mounts.push(VolumeMount {
             name: "revocation-list".to_owned(),
             mount_path: REVOCATION_LIST_MOUNT_DIR.to_owned(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+    }
+
+    for m in secret_mounts {
+        mounts.push(VolumeMount {
+            name: secret_volume_name(&m.name),
+            // Never subPath: only a directory mount follows Secret updates.
+            mount_path: m.mount_path.clone(),
             read_only: Some(true),
             ..Default::default()
         });
@@ -1564,5 +1601,167 @@ mod tests {
         let name = plugin_volume_name(&very_long);
         assert!(name.len() <= 63, "got {} chars", name.len());
         assert!(name.starts_with("plugin-"));
+    }
+
+    // ── Secret mounts ──────────────────────────────────────────
+
+    fn secret_mount(name: &str, mount_path: &str) -> SecretMount {
+        SecretMount {
+            name: name.into(),
+            mount_path: mount_path.into(),
+        }
+    }
+
+    #[test]
+    fn secret_mounts_render_read_only_volume_and_mount() {
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec {
+                secret_mounts: vec![
+                    secret_mount("mcpg-tenant-secrets", "/var/run/mcpg/secrets"),
+                    secret_mount("gateway-tls", "/etc/mcpg/tls"),
+                ],
+                ..Default::default()
+            }),
+            "h",
+            &[],
+            None,
+            None,
+            &Default::default(),
+            &[],
+        );
+        let pod = d.spec.unwrap().template.spec.unwrap();
+
+        let volumes = pod.volumes.as_ref().unwrap();
+        let vol = volumes
+            .iter()
+            .find(|v| v.name == "secret-mcpg-tenant-secrets")
+            .expect("secret volume present");
+        let src = vol.secret.as_ref().expect("a Secret volume source");
+        assert_eq!(src.secret_name.as_deref(), Some("mcpg-tenant-secrets"));
+        assert_eq!(
+            src.default_mode,
+            Some(0o440),
+            "readable by the gateway through fsGroup, never executable"
+        );
+        assert!(src.items.is_none(), "every key projects as a file");
+        assert!(volumes.iter().any(|v| v.name == "secret-gateway-tls"));
+
+        let mounts = pod.containers[0].volume_mounts.as_ref().unwrap();
+        let mount = mounts
+            .iter()
+            .find(|m| m.name == "secret-mcpg-tenant-secrets")
+            .expect("secret mount present");
+        assert_eq!(mount.mount_path, "/var/run/mcpg/secrets");
+        assert_eq!(mount.read_only, Some(true));
+        assert!(
+            mount.sub_path.is_none(),
+            "a subPath mount never sees Secret updates"
+        );
+        let tls = mounts
+            .iter()
+            .find(|m| m.name == "secret-gateway-tls")
+            .expect("second secret mount present");
+        assert_eq!(tls.mount_path, "/etc/mcpg/tls");
+        assert_eq!(tls.read_only, Some(true));
+    }
+
+    #[test]
+    fn secret_mounts_come_after_every_other_volume() {
+        let rev = RevocationListMount {
+            config_map_name: "payments-gateway-revocations".into(),
+            content_hash: "deadc0de".into(),
+        };
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec {
+                secret_mounts: vec![secret_mount("mcpg-tenant-secrets", "/var/run/mcpg/secrets")],
+                ..Default::default()
+            }),
+            "h",
+            &[plugin_mount("dev.mcpg.policy.cedar", "mcpg-plugin-pol-c-1")],
+            None,
+            Some(&rev),
+            &Default::default(),
+            &[],
+        );
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        let volume_names: Vec<&str> = pod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect();
+        assert_eq!(
+            volume_names,
+            vec![
+                "config",
+                "runtime",
+                "plugin-dev-mcpg-policy-cedar",
+                "revocation-list",
+                "secret-mcpg-tenant-secrets",
+            ]
+        );
+        let mount_names: Vec<&str> = pod.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(
+            mount_names,
+            vec![
+                "config",
+                "runtime",
+                "plugin-dev-mcpg-policy-cedar",
+                "revocation-list",
+                "secret-mcpg-tenant-secrets",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_secret_volume_without_secret_mounts() {
+        let d = build_deployment(
+            &fixture(MCPGGatewaySpec::default()),
+            "h",
+            &[],
+            None,
+            None,
+            &Default::default(),
+            &[],
+        );
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        assert!(
+            pod.volumes
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|v| v.secret.is_none() && !v.name.starts_with("secret-"))
+        );
+        assert!(
+            pod.containers[0]
+                .volume_mounts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|m| !m.name.starts_with("secret-"))
+        );
+    }
+
+    #[test]
+    fn secret_volume_name_is_rfc1123() {
+        assert_eq!(
+            secret_volume_name("mcpg-tenant-secrets"),
+            "secret-mcpg-tenant-secrets"
+        );
+        // A Secret name is a DNS subdomain (dots allowed); a volume name is a
+        // DNS label.
+        assert_eq!(
+            secret_volume_name("tenant.secrets.v2"),
+            "secret-tenant-secrets-v2"
+        );
+        let name = secret_volume_name(&"x".repeat(200));
+        assert!(name.len() <= 63, "got {} chars", name.len());
     }
 }
