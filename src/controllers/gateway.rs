@@ -605,10 +605,17 @@ async fn reconcile_inner(
     if let Some(cloud) = &obj.spec.cloud
         && !cloud.external_url.is_empty()
     {
+        // The tag the Deployment renderer resolves: the CR's, else the
+        // operator's default pin.
+        let gateway_tag: &str = match obj.spec.image.tag.as_deref() {
+            Some(tag) => tag,
+            None => crate::default_gateway_image_tag(),
+        };
         inject_resource_metadata(
             &mut merged_config,
             &cloud.external_url,
             &cloud.custom_domains,
+            Some(gateway_tag),
         );
     }
     apply_cloud_default_plugins(
@@ -1821,6 +1828,27 @@ fn ensure_path<'a>(root: &'a mut serde_json::Value, path: &[&str]) -> &'a mut se
     cur
 }
 
+/// The first gateway release whose config schema carries
+/// `resource_metadata.additional_resources`. See [`gateway_at_least`].
+const ADDITIONAL_RESOURCES_MIN_GATEWAY: &str = "0.1.0-beta.41";
+
+/// Whether a gateway image `tag` is at or past `min` (semver, prerelease
+/// aware, leading `v` allowed). A rendered config is loaded by whatever
+/// image the pod runs, and the gateway refuses unknown keys, so a key
+/// that a version does not know must not be rendered for it: the running
+/// pod keeps serving the old config, but every replacement pod crash-loops
+/// on the new one. A tag that is not a version (`latest`, a local build)
+/// is taken as current.
+fn gateway_at_least(tag: Option<&str>, min: &str) -> bool {
+    let Some(tag) = tag.map(|t| t.trim().trim_start_matches('v')) else {
+        return true;
+    };
+    match (semver::Version::parse(tag), semver::Version::parse(min)) {
+        (Ok(have), Ok(want)) => have >= want,
+        _ => true,
+    }
+}
+
 /// Stamp the operator-trusted external resource indicator into
 /// `governance.access.resource_metadata.resource`, and one identifier per
 /// bound custom domain into `additional_resources` (same path as the
@@ -1829,8 +1857,15 @@ fn ensure_path<'a>(root: &'a mut serde_json::Value, path: &[&str]) -> &'a mut se
 /// any published value — in managed-cloud the indicators are a trust
 /// boundary (a tenant must not be able to claim another instance's OAuth
 /// audience, and the CP only ships DNS-verified domains), so the operator
-/// is the sole writer of both keys.
-fn inject_resource_metadata(config: &mut serde_json::Value, url: &str, custom_domains: &[String]) {
+/// is the sole writer of both keys. `additional_resources` is written only
+/// for a gateway that knows the key ([`gateway_at_least`]); an older
+/// gateway keeps the canonical identifier on every hostname.
+fn inject_resource_metadata(
+    config: &mut serde_json::Value,
+    url: &str,
+    custom_domains: &[String],
+    gateway_tag: Option<&str>,
+) {
     let rm = ensure_path(config, &["governance", "access", "resource_metadata"]);
     if !rm.is_object() {
         *rm = serde_json::json!({});
@@ -1845,10 +1880,24 @@ fn inject_resource_metadata(config: &mut serde_json::Value, url: &str, custom_do
         .or_else(|| url.strip_prefix("http://"))
         .and_then(|rest| rest.find('/').map(|i| &rest[i..]))
         .unwrap_or("/mcp");
-    let additional: Vec<serde_json::Value> = custom_domains
-        .iter()
-        .map(|domain| serde_json::Value::String(format!("https://{domain}{path}")))
-        .collect();
+    let supported = gateway_at_least(gateway_tag, ADDITIONAL_RESOURCES_MIN_GATEWAY);
+    if !supported && !custom_domains.is_empty() {
+        warn!(
+            gateway_tag = gateway_tag.unwrap_or("<default>"),
+            minimum = ADDITIONAL_RESOURCES_MIN_GATEWAY,
+            domains = custom_domains.len(),
+            "custom domains not advertised as OAuth resources: the gateway image predates \
+             resource_metadata.additional_resources; move the instance to a newer image"
+        );
+    }
+    let additional: Vec<serde_json::Value> = if supported {
+        custom_domains
+            .iter()
+            .map(|domain| serde_json::Value::String(format!("https://{domain}{path}")))
+            .collect()
+    } else {
+        Vec::new()
+    };
     if additional.is_empty() {
         rm.remove("additional_resources");
     } else {
@@ -2132,7 +2181,7 @@ mod tests {
     #[test]
     fn inject_resource_metadata_creates_path() {
         let mut cfg = serde_json::json!({});
-        inject_resource_metadata(&mut cfg, "https://edge-1.mcpg.cloud/mcp", &[]);
+        inject_resource_metadata(&mut cfg, "https://edge-1.mcpg.cloud/mcp", &[], None);
         assert_eq!(
             cfg["governance"]["access"]["resource_metadata"]["resource"],
             serde_json::json!("https://edge-1.mcpg.cloud/mcp")
@@ -2149,7 +2198,7 @@ mod tests {
                 "authorization_servers": ["https://idp.example/"]
             }}}
         });
-        inject_resource_metadata(&mut cfg, "https://attacker.mcpg.cloud/mcp", &[]);
+        inject_resource_metadata(&mut cfg, "https://attacker.mcpg.cloud/mcp", &[], None);
         let rm = &cfg["governance"]["access"]["resource_metadata"];
         assert_eq!(
             rm["resource"],
@@ -2176,6 +2225,7 @@ mod tests {
             &mut cfg,
             "https://edge-1.mcpg.cloud/mcp",
             &["mcp.acme.com".to_owned(), "tools.acme.com".to_owned()],
+            Some("0.1.0-beta.41"),
         );
         let rm = &cfg["governance"]["access"]["resource_metadata"];
         assert_eq!(
@@ -2183,7 +2233,7 @@ mod tests {
             serde_json::json!(["https://mcp.acme.com/mcp", "https://tools.acme.com/mcp"])
         );
 
-        inject_resource_metadata(&mut cfg, "https://edge-1.mcpg.cloud/mcp", &[]);
+        inject_resource_metadata(&mut cfg, "https://edge-1.mcpg.cloud/mcp", &[], None);
         assert!(
             cfg["governance"]["access"]["resource_metadata"]
                 .get("additional_resources")
@@ -2191,12 +2241,56 @@ mod tests {
         );
     }
 
+    /// A gateway older than the key's first release is never handed
+    /// `additional_resources` — it would refuse the whole config — and a
+    /// published list is still stripped; the canonical `resource` is
+    /// written regardless.
+    #[test]
+    fn inject_resource_metadata_withholds_the_key_from_an_older_gateway() {
+        let mut cfg = serde_json::json!({
+            "governance": { "access": { "resource_metadata": {
+                "additional_resources": ["https://victim.example/mcp"]
+            }}}
+        });
+        inject_resource_metadata(
+            &mut cfg,
+            "https://edge-1.mcpg.cloud/mcp",
+            &["mcp.acme.com".to_owned()],
+            Some("0.1.0-beta.40"),
+        );
+        let rm = &cfg["governance"]["access"]["resource_metadata"];
+        assert_eq!(
+            rm["resource"],
+            serde_json::json!("https://edge-1.mcpg.cloud/mcp")
+        );
+        assert!(rm.get("additional_resources").is_none());
+    }
+
+    #[test]
+    fn gateway_at_least_is_prerelease_aware_and_lenient_on_non_versions() {
+        let min = ADDITIONAL_RESOURCES_MIN_GATEWAY;
+        assert!(gateway_at_least(Some("0.1.0-beta.41"), min));
+        assert!(gateway_at_least(Some("v0.1.0-beta.41"), min));
+        assert!(gateway_at_least(Some("0.1.0-beta.42"), min));
+        assert!(gateway_at_least(Some("0.1.0-rc.1"), min));
+        assert!(gateway_at_least(Some("0.1.0"), min));
+        assert!(gateway_at_least(Some("1.0.0-rc.1"), min));
+        assert!(gateway_at_least(Some("v1.0.0-dev"), min));
+        assert!(!gateway_at_least(Some("0.1.0-beta.40"), min));
+        assert!(!gateway_at_least(Some("0.1.0-beta.9"), min));
+        assert!(!gateway_at_least(Some("0.0.9"), min));
+        // Not a version: taken as current rather than silently degraded.
+        assert!(gateway_at_least(Some("latest"), min));
+        assert!(gateway_at_least(Some("sha-abc123"), min));
+        assert!(gateway_at_least(None, min));
+    }
+
     #[test]
     fn inject_resource_metadata_replaces_non_object_node() {
         let mut cfg = serde_json::json!({
             "governance": { "access": { "resource_metadata": "bogus" }}
         });
-        inject_resource_metadata(&mut cfg, "https://edge-1.mcpg.cloud/mcp", &[]);
+        inject_resource_metadata(&mut cfg, "https://edge-1.mcpg.cloud/mcp", &[], None);
         assert_eq!(
             cfg["governance"]["access"]["resource_metadata"]["resource"],
             serde_json::json!("https://edge-1.mcpg.cloud/mcp")
@@ -2213,6 +2307,12 @@ mod tests {
             &mut cfg,
             "https://edge-1.mcpg.cloud/mcp",
             &["mcp.acme.com".to_owned()],
+            None,
+        );
+        assert!(
+            cfg["governance"]["access"]["resource_metadata"]
+                .get("additional_resources")
+                .is_some()
         );
         let yaml = serde_yaml::to_string(&cfg).expect("serialize config");
         let parsed = mcpg::config::AppConfig::load_from_yaml_str(&yaml)
