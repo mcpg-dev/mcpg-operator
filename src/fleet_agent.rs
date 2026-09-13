@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
+use k8s_openapi::api::core::v1::{Namespace, Node, Pod, Secret};
 use kube::api::{Api, DeleteParams, DynamicObject, Patch, PatchParams, PropagationPolicy};
 use kube::discovery::{Discovery, Scope};
 use kube::{Client, ResourceExt};
@@ -138,12 +138,29 @@ impl LocalApplier for KubeCellApplier {
             ..Default::default()
         };
         match api.delete(instance_uid, &dp).await {
-            Ok(_) => Ok(()),
+            Ok(_) => {}
             // 404-tolerant: a repeated revocation must converge, not error
             // forever.
-            Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
-            Err(e) => Err(anyhow::anyhow!("delete gateway {instance_uid}: {e}")),
+            Err(kube::Error::Api(e)) if e.code == 404 => {}
+            Err(e) => return Err(anyhow::anyhow!("delete gateway {instance_uid}: {e}")),
         }
+        // The Secrets the fleet rendered beside the CR go with it — by name,
+        // never by selector: the namespace holds the org's other instances.
+        // Best-effort: the workload is gone either way, and a revocation that
+        // failed here would be retried forever on a cell whose agent lacks
+        // the delete verb.
+        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        for name in mcpg_fleet_proto::instance_secrets::instance_secret_names(instance_uid) {
+            match secrets.delete(&name, &DeleteParams::default()).await {
+                Ok(_) => {}
+                Err(kube::Error::Api(e)) if e.code == 404 => {}
+                Err(e) => warn!(
+                    %instance_uid, %namespace, secret = %name, error = %e,
+                    "fleet agent: instance Secret was not removed with its gateway"
+                ),
+            }
+        }
+        Ok(())
     }
 
     async fn delete_namespace(&self, namespace: &str) -> anyhow::Result<()> {

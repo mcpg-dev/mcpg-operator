@@ -987,7 +987,7 @@ mod tests {
             &fixture(MCPGGatewaySpec {
                 env_from_secrets: vec![
                     LocalObjectReference {
-                        name: "mcpg-cluster-coordination".into(),
+                        name: "mcpg-cluster-coordination-gw-1".into(),
                     },
                     LocalObjectReference {
                         name: "tenant-extra-env".into(),
@@ -1013,7 +1013,10 @@ mod tests {
             .iter()
             .map(|e| e.secret_ref.as_ref().unwrap().name.as_str())
             .collect();
-        assert_eq!(names, vec!["mcpg-cluster-coordination", "tenant-extra-env"]);
+        assert_eq!(
+            names,
+            vec!["mcpg-cluster-coordination-gw-1", "tenant-extra-env"]
+        );
         for e in env_from {
             assert_eq!(
                 e.secret_ref.as_ref().unwrap().optional,
@@ -1617,7 +1620,7 @@ mod tests {
         let d = build_deployment(
             &fixture(MCPGGatewaySpec {
                 secret_mounts: vec![
-                    secret_mount("mcpg-tenant-secrets", "/var/run/mcpg/secrets"),
+                    secret_mount("mcpg-tenant-secrets-gw-1", "/var/run/mcpg/secrets"),
                     secret_mount("gateway-tls", "/etc/mcpg/tls"),
                 ],
                 ..Default::default()
@@ -1634,10 +1637,10 @@ mod tests {
         let volumes = pod.volumes.as_ref().unwrap();
         let vol = volumes
             .iter()
-            .find(|v| v.name == "secret-mcpg-tenant-secrets")
+            .find(|v| v.name == "secret-mcpg-tenant-secrets-gw-1")
             .expect("secret volume present");
         let src = vol.secret.as_ref().expect("a Secret volume source");
-        assert_eq!(src.secret_name.as_deref(), Some("mcpg-tenant-secrets"));
+        assert_eq!(src.secret_name.as_deref(), Some("mcpg-tenant-secrets-gw-1"));
         assert_eq!(
             src.default_mode,
             Some(0o440),
@@ -1649,7 +1652,7 @@ mod tests {
         let mounts = pod.containers[0].volume_mounts.as_ref().unwrap();
         let mount = mounts
             .iter()
-            .find(|m| m.name == "secret-mcpg-tenant-secrets")
+            .find(|m| m.name == "secret-mcpg-tenant-secrets-gw-1")
             .expect("secret mount present");
         assert_eq!(mount.mount_path, "/var/run/mcpg/secrets");
         assert_eq!(mount.read_only, Some(true));
@@ -1673,7 +1676,10 @@ mod tests {
         };
         let d = build_deployment(
             &fixture(MCPGGatewaySpec {
-                secret_mounts: vec![secret_mount("mcpg-tenant-secrets", "/var/run/mcpg/secrets")],
+                secret_mounts: vec![secret_mount(
+                    "mcpg-tenant-secrets-gw-1",
+                    "/var/run/mcpg/secrets",
+                )],
                 ..Default::default()
             }),
             "h",
@@ -1698,7 +1704,7 @@ mod tests {
                 "runtime",
                 "plugin-dev-mcpg-policy-cedar",
                 "revocation-list",
-                "secret-mcpg-tenant-secrets",
+                "secret-mcpg-tenant-secrets-gw-1",
             ]
         );
         let mount_names: Vec<&str> = pod.containers[0]
@@ -1715,7 +1721,7 @@ mod tests {
                 "runtime",
                 "plugin-dev-mcpg-policy-cedar",
                 "revocation-list",
-                "secret-mcpg-tenant-secrets",
+                "secret-mcpg-tenant-secrets-gw-1",
             ]
         );
     }
@@ -1752,9 +1758,19 @@ mod tests {
     #[test]
     fn secret_volume_name_is_rfc1123() {
         assert_eq!(
-            secret_volume_name("mcpg-tenant-secrets"),
-            "secret-mcpg-tenant-secrets"
+            secret_volume_name("mcpg-tenant-secrets-gw-1"),
+            "secret-mcpg-tenant-secrets-gw-1"
         );
+        // The managed platform mounts one tenant Secret per instance, named
+        // after a hyphenated UUID: the volume name lands exactly on the
+        // label limit without truncation.
+        let managed =
+            secret_volume_name("mcpg-tenant-secrets-019930f5-4a3e-7c1b-9d2e-0f3a4b5c6d7e");
+        assert_eq!(
+            managed,
+            "secret-mcpg-tenant-secrets-019930f5-4a3e-7c1b-9d2e-0f3a4b5c6d7e"
+        );
+        assert_eq!(managed.len(), 63);
         // A Secret name is a DNS subdomain (dots allowed); a volume name is a
         // DNS label.
         assert_eq!(

@@ -549,7 +549,7 @@ mod tests {
         let s = MCPGGatewaySpec {
             env_from_secrets: vec![
                 LocalObjectReference {
-                    name: "mcpg-cluster-coordination".into(),
+                    name: "mcpg-cluster-coordination-gw-1".into(),
                 },
                 LocalObjectReference { name: "  ".into() },
             ],
@@ -564,7 +564,7 @@ mod tests {
         use mcpg_operator_api::v1alpha1::LocalObjectReference;
         let s = MCPGGatewaySpec {
             env_from_secrets: vec![LocalObjectReference {
-                name: "mcpg-cluster-coordination".into(),
+                name: "mcpg-cluster-coordination-gw-1".into(),
             }],
             ..valid_spec()
         };
@@ -582,7 +582,7 @@ mod tests {
     fn accepts_well_formed_secret_mounts() {
         let s = MCPGGatewaySpec {
             secret_mounts: vec![
-                secret_mount("mcpg-tenant-secrets", "/var/run/mcpg/secrets"),
+                secret_mount("mcpg-tenant-secrets-gw-1", "/var/run/mcpg/secrets"),
                 secret_mount("gateway-tls", "/etc/mcpg/tls"),
             ],
             ..valid_spec()
@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn rejects_secret_mount_with_relative_path() {
         let s = MCPGGatewaySpec {
-            secret_mounts: vec![secret_mount("mcpg-tenant-secrets", "secrets")],
+            secret_mounts: vec![secret_mount("mcpg-tenant-secrets-gw-1", "secrets")],
             ..valid_spec()
         };
         let err = validate_spec(&fixture(s)).unwrap_err();
@@ -614,8 +614,8 @@ mod tests {
     fn rejects_repeated_secret_mount_name_or_path() {
         let s = MCPGGatewaySpec {
             secret_mounts: vec![
-                secret_mount("mcpg-tenant-secrets", "/var/run/mcpg/secrets"),
-                secret_mount("mcpg-tenant-secrets", "/etc/mcpg/tls"),
+                secret_mount("mcpg-tenant-secrets-gw-1", "/var/run/mcpg/secrets"),
+                secret_mount("mcpg-tenant-secrets-gw-1", "/etc/mcpg/tls"),
             ],
             ..valid_spec()
         };
@@ -624,7 +624,7 @@ mod tests {
 
         let s = MCPGGatewaySpec {
             secret_mounts: vec![
-                secret_mount("mcpg-tenant-secrets", "/var/run/mcpg/secrets"),
+                secret_mount("mcpg-tenant-secrets-gw-1", "/var/run/mcpg/secrets"),
                 secret_mount("gateway-tls", "/var/run/mcpg/secrets/"),
             ],
             ..valid_spec()

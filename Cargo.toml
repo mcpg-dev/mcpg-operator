@@ -1,7 +1,7 @@
 [package]
 name = "mcpg-operator"
 description = "Kubernetes operator for managing MCPG (Model Context Protocol Gateway) deployments"
-version = "0.1.0-beta.36"
+version = "0.1.0-beta.37"
 edition = "2024"
 license = "BUSL-1.1"
 repository = "https://github.com/mcpg-dev/mcpg-operator"
