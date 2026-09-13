@@ -19,6 +19,10 @@ use mcpg_operator_api::v1alpha1::MCPGGateway;
 use crate::templates::common::{child_name, owner_ref, standard_labels};
 
 const GATEWAY_PORT: u16 = 8787;
+/// Path prefixes the edge forwards to a tenant gateway (Gateway API
+/// `PathPrefix`, element-boundary matching): the MCP endpoint and the
+/// gateway's OAuth / AAuth discovery and token paths.
+pub const FORWARDED_PATH_PREFIXES: [&str; 4] = ["/mcp", "/.well-known", "/oauth", "/aauth"];
 /// The shared platform edge Gateway the per-instance routes attach to and the
 /// custom-domain listeners are applied onto (`templates::edge`). The edge
 /// itself is provisioned by the `mcpg-cloud-edge` chart; making these
@@ -122,12 +126,20 @@ pub fn build_httproute(parent: &MCPGGateway) -> Option<HTTPRoute> {
         hostnames,
         rules: vec![HttpRouteRule {
             // Host carries the instance identity; serve native /mcp, no rewrite.
-            matches: vec![HttpRouteMatch {
-                path: HttpPathMatch {
-                    r#type: "PathPrefix".into(),
-                    value: "/mcp".into(),
-                },
-            }],
+            // The OAuth / AAuth surface rides on the same origin — a host
+            // fetches `/.well-known/oauth-protected-resource` and redeems
+            // grants at `/oauth/token` on the URL it connected to — so those
+            // prefixes forward too. Probes, metrics, webhooks and plugin HTTP
+            // routes stay off the edge.
+            matches: FORWARDED_PATH_PREFIXES
+                .iter()
+                .map(|prefix| HttpRouteMatch {
+                    path: HttpPathMatch {
+                        r#type: "PathPrefix".into(),
+                        value: (*prefix).into(),
+                    },
+                })
+                .collect(),
             backend_refs: vec![HttpBackendRef {
                 name: service,
                 port,
@@ -193,7 +205,9 @@ mod tests {
             vec!["edge-1.mcpg.cloud".to_string(), "mcp.acme.com".to_string()]
         );
         let rule = &route.spec.rules[0];
-        assert_eq!(rule.matches[0].path.value, "/mcp");
+        let prefixes: Vec<&str> = rule.matches.iter().map(|m| m.path.value.as_str()).collect();
+        assert_eq!(prefixes, vec!["/mcp", "/.well-known", "/oauth", "/aauth"]);
+        assert!(rule.matches.iter().all(|m| m.path.r#type == "PathPrefix"));
         assert_eq!(rule.backend_refs[0].name, "edge-1");
         assert_eq!(rule.backend_refs[0].port, 8787);
         assert_eq!(route.spec.parent_refs[0].name, "mcpg-cloud-gateway");

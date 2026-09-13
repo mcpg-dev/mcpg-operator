@@ -595,16 +595,21 @@ async fn reconcile_inner(
             "merged provisioned MCP servers into federations"
         );
     }
-    // Managed-cloud: stamp the operator-trusted external resource indicator into
-    // `governance.access.resource_metadata.resource` so the gateway advertises
-    // the canonical `https://{slug}.<domain>/mcp` URL for OAuth resource-indicator
-    // validation (RFC 8707/9728). Always OVERWRITES — a published config must
-    // never set its own indicator (a tenant could otherwise claim another's
-    // audience). Folds into `config_hash` so a URL change rolls the pod.
+    // Managed-cloud: stamp the operator-trusted external resource indicators into
+    // `governance.access.resource_metadata` so the gateway advertises the
+    // canonical `https://{slug}.<domain>/mcp` URL — and each bound custom
+    // domain — for OAuth resource-indicator validation (RFC 8707/9728). Always
+    // OVERWRITES — a published config must never set its own indicators (a
+    // tenant could otherwise claim another's audience). Folds into
+    // `config_hash` so a URL or domain change rolls the pod.
     if let Some(cloud) = &obj.spec.cloud
         && !cloud.external_url.is_empty()
     {
-        inject_resource_metadata(&mut merged_config, &cloud.external_url);
+        inject_resource_metadata(
+            &mut merged_config,
+            &cloud.external_url,
+            &cloud.custom_domains,
+        );
     }
     apply_cloud_default_plugins(
         &obj,
@@ -1817,19 +1822,41 @@ fn ensure_path<'a>(root: &'a mut serde_json::Value, path: &[&str]) -> &'a mut se
 }
 
 /// Stamp the operator-trusted external resource indicator into
-/// `governance.access.resource_metadata.resource`. Always overwrites any
-/// published value — in managed-cloud the indicator is a trust boundary
-/// (a tenant must not be able to claim another instance's OAuth audience),
-/// so the operator is the sole writer.
-fn inject_resource_metadata(config: &mut serde_json::Value, url: &str) {
+/// `governance.access.resource_metadata.resource`, and one identifier per
+/// bound custom domain into `additional_resources` (same path as the
+/// canonical URL), so the gateway answers a request on any bound hostname
+/// with a `resource` equal to the URL the client used. Always overwrites
+/// any published value — in managed-cloud the indicators are a trust
+/// boundary (a tenant must not be able to claim another instance's OAuth
+/// audience, and the CP only ships DNS-verified domains), so the operator
+/// is the sole writer of both keys.
+fn inject_resource_metadata(config: &mut serde_json::Value, url: &str, custom_domains: &[String]) {
     let rm = ensure_path(config, &["governance", "access", "resource_metadata"]);
     if !rm.is_object() {
         *rm = serde_json::json!({});
     }
-    rm.as_object_mut().expect("just ensured object").insert(
+    let rm = rm.as_object_mut().expect("just ensured object");
+    rm.insert(
         "resource".to_owned(),
         serde_json::Value::String(url.to_owned()),
     );
+    let path = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .and_then(|rest| rest.find('/').map(|i| &rest[i..]))
+        .unwrap_or("/mcp");
+    let additional: Vec<serde_json::Value> = custom_domains
+        .iter()
+        .map(|domain| serde_json::Value::String(format!("https://{domain}{path}")))
+        .collect();
+    if additional.is_empty() {
+        rm.remove("additional_resources");
+    } else {
+        rm.insert(
+            "additional_resources".to_owned(),
+            serde_json::Value::Array(additional),
+        );
+    }
 }
 
 /// Render an `MCPGRevocationList` into the
@@ -2105,7 +2132,7 @@ mod tests {
     #[test]
     fn inject_resource_metadata_creates_path() {
         let mut cfg = serde_json::json!({});
-        inject_resource_metadata(&mut cfg, "https://edge-1.mcpg.cloud/mcp");
+        inject_resource_metadata(&mut cfg, "https://edge-1.mcpg.cloud/mcp", &[]);
         assert_eq!(
             cfg["governance"]["access"]["resource_metadata"]["resource"],
             serde_json::json!("https://edge-1.mcpg.cloud/mcp")
@@ -2122,7 +2149,7 @@ mod tests {
                 "authorization_servers": ["https://idp.example/"]
             }}}
         });
-        inject_resource_metadata(&mut cfg, "https://attacker.mcpg.cloud/mcp");
+        inject_resource_metadata(&mut cfg, "https://attacker.mcpg.cloud/mcp", &[]);
         let rm = &cfg["governance"]["access"]["resource_metadata"];
         assert_eq!(
             rm["resource"],
@@ -2135,12 +2162,41 @@ mod tests {
         );
     }
 
+    /// Every bound custom domain becomes an additional resource identifier
+    /// on the canonical path; a published list is overwritten (or removed
+    /// when no domain is bound) — the operator is the sole writer.
+    #[test]
+    fn inject_resource_metadata_lists_custom_domains() {
+        let mut cfg = serde_json::json!({
+            "governance": { "access": { "resource_metadata": {
+                "additional_resources": ["https://victim.example/mcp"]
+            }}}
+        });
+        inject_resource_metadata(
+            &mut cfg,
+            "https://edge-1.mcpg.cloud/mcp",
+            &["mcp.acme.com".to_owned(), "tools.acme.com".to_owned()],
+        );
+        let rm = &cfg["governance"]["access"]["resource_metadata"];
+        assert_eq!(
+            rm["additional_resources"],
+            serde_json::json!(["https://mcp.acme.com/mcp", "https://tools.acme.com/mcp"])
+        );
+
+        inject_resource_metadata(&mut cfg, "https://edge-1.mcpg.cloud/mcp", &[]);
+        assert!(
+            cfg["governance"]["access"]["resource_metadata"]
+                .get("additional_resources")
+                .is_none()
+        );
+    }
+
     #[test]
     fn inject_resource_metadata_replaces_non_object_node() {
         let mut cfg = serde_json::json!({
             "governance": { "access": { "resource_metadata": "bogus" }}
         });
-        inject_resource_metadata(&mut cfg, "https://edge-1.mcpg.cloud/mcp");
+        inject_resource_metadata(&mut cfg, "https://edge-1.mcpg.cloud/mcp", &[]);
         assert_eq!(
             cfg["governance"]["access"]["resource_metadata"]["resource"],
             serde_json::json!("https://edge-1.mcpg.cloud/mcp")
@@ -2153,7 +2209,11 @@ mod tests {
     #[test]
     fn injected_resource_metadata_roundtrips_through_appconfig() {
         let mut cfg = serde_json::json!({});
-        inject_resource_metadata(&mut cfg, "https://edge-1.mcpg.cloud/mcp");
+        inject_resource_metadata(
+            &mut cfg,
+            "https://edge-1.mcpg.cloud/mcp",
+            &["mcp.acme.com".to_owned()],
+        );
         let yaml = serde_yaml::to_string(&cfg).expect("serialize config");
         let parsed = mcpg::config::AppConfig::load_from_yaml_str(&yaml)
             .expect("rendered cloud config must deserialise into AppConfig");
