@@ -110,8 +110,10 @@ pub async fn run(ctx: Arc<ControllerContext>) -> anyhow::Result<()> {
         "starting plugin-set controller"
     );
 
-    let controller = Controller::new(api, watcher::Config::default());
-    let set_store = controller.store();
+    // A filtered trigger: the operator's own status writes must not schedule
+    // another reconcile (see reconcile::watch).
+    let (trigger, set_store) = crate::reconcile::spec_changes(api);
+    let controller = Controller::for_stream(trigger, set_store.clone());
 
     controller
         .owns(

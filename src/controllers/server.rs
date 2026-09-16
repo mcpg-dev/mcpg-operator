@@ -89,7 +89,10 @@ pub async fn run(ctx: Arc<ControllerContext>) -> anyhow::Result<()> {
 
     info!("starting server controller");
 
-    Controller::new(api, watcher::Config::default())
+    // A filtered trigger: the operator's own status writes must not schedule
+    // another reconcile (see reconcile::watch).
+    let (trigger, store) = crate::reconcile::spec_changes(api);
+    Controller::for_stream(trigger, store)
         .owns(
             Api::<Deployment>::all(ctx.client.clone()),
             watcher::Config::default(),

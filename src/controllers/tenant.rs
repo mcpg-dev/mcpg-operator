@@ -36,7 +36,6 @@ use kube::api::{Api, Patch, PatchParams};
 use kube::core::ObjectMeta;
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::events::{Event as K8sEvent, EventType};
-use kube::runtime::watcher;
 use kube::{Resource, ResourceExt};
 use mcpg_operator_api::conditions::{Condition, reasons, set_condition, types as ctype};
 use mcpg_operator_api::v1alpha1::{
@@ -95,7 +94,10 @@ pub async fn run(ctx: Arc<ControllerContext>) -> anyhow::Result<()> {
 
     info!("starting tenant controller");
 
-    Controller::new(api, watcher::Config::default())
+    // A filtered trigger: the operator's own status writes must not schedule
+    // another reconcile (see reconcile::watch).
+    let (trigger, store) = crate::reconcile::spec_changes(api);
+    Controller::for_stream(trigger, store)
         .shutdown_on_signal()
         .run(reconcile, error_policy, ctx)
         .for_each(|res| async move {

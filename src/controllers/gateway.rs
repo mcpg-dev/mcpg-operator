@@ -242,14 +242,15 @@ pub async fn run(ctx: Arc<ControllerContext>) -> anyhow::Result<()> {
         "starting gateway controller"
     );
 
-    let controller = Controller::new(api, watcher::Config::default());
-    // Snapshot of every MCPGGateway under the controller's
-    // watch. Used by the cross-CRD `.watches()` closures to
-    // map a plugin-set / revocation-list change back to the
-    // set of gateways that need re-reconciliation. The store
-    // is populated by the controller's own internal watcher;
-    // closures can read it synchronously.
-    let gateway_store = controller.store();
+    // A filtered trigger: the operator's own status writes must not schedule
+    // another reconcile (see reconcile::watch).
+    let (trigger, gateway_store) = crate::reconcile::spec_changes(api);
+    let controller = Controller::for_stream(trigger, gateway_store.clone());
+    // `gateway_store` is a snapshot of every MCPGGateway under the
+    // controller's watch, populated by the same reflector that feeds the
+    // trigger. The cross-CRD `.watches()` closures read it synchronously to
+    // map a plugin-set / revocation-list change back to the set of gateways
+    // that need re-reconciliation.
 
     // Publish the initial-LIST completion. kube-runtime gates the
     // whole applier on it (`delay_tasks_until(store.wait_until_ready())`)
@@ -611,12 +612,29 @@ async fn reconcile_inner(
             Some(tag) => tag,
             None => crate::default_gateway_image_tag(),
         };
+        // A canonical URL means the instance advertises ONE identity: that URL
+        // is the OAuth resource, every other name it answers on redirects to
+        // it, and nothing else is advertised as a resource — a host a client
+        // is sent away from cannot be one.
+        let canonical = cloud
+            .canonical_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty());
+        let advertised = canonical.unwrap_or(&cloud.external_url);
+        let also_serving: &[String] = if canonical.is_some() {
+            &[]
+        } else {
+            &cloud.custom_domains
+        };
         inject_resource_metadata(
             &mut merged_config,
-            &cloud.external_url,
-            &cloud.custom_domains,
+            advertised,
+            also_serving,
             Some(gateway_tag),
         );
+        if canonical.is_some() {
+            inject_canonical_url(&mut merged_config, advertised, Some(gateway_tag));
+        }
     }
     apply_cloud_default_plugins(
         &obj,
@@ -1832,6 +1850,10 @@ fn ensure_path<'a>(root: &'a mut serde_json::Value, path: &[&str]) -> &'a mut se
 /// `resource_metadata.additional_resources`. See [`gateway_at_least`].
 const ADDITIONAL_RESOURCES_MIN_GATEWAY: &str = "0.1.0-beta.41";
 
+/// First gateway release whose `ServerConfig` accepts `canonical_url`.
+/// See [`inject_canonical_url`].
+const CANONICAL_URL_MIN_GATEWAY: &str = "0.1.0-beta.44";
+
 /// Whether a gateway image `tag` is at or past `min` (semver, prerelease
 /// aware, leading `v` allowed). A rendered config is loaded by whatever
 /// image the pod runs, and the gateway refuses unknown keys, so a key
@@ -1906,6 +1928,38 @@ fn inject_resource_metadata(
             serde_json::Value::Array(additional),
         );
     }
+}
+
+/// Stamp `gateway.server.canonical_url`, so the gateway serves MCP on the
+/// advertised URL alone and answers `308` on every other name it is reachable
+/// by. Always overwrites: which URL a managed instance advertises is the
+/// platform's to decide, and a published value naming someone else's host
+/// would redirect this tenant's clients there.
+///
+/// Written only for a gateway that knows the key. `ServerConfig` is
+/// `deny_unknown_fields`, so handing this to an older image does not degrade
+/// it — the config fails to parse and the pod crash-loops. An instance left
+/// on an older image keeps serving on every hostname instead, which is the
+/// behaviour it had before the key existed.
+fn inject_canonical_url(config: &mut serde_json::Value, url: &str, gateway_tag: Option<&str>) {
+    if !gateway_at_least(gateway_tag, CANONICAL_URL_MIN_GATEWAY) {
+        warn!(
+            gateway_tag = gateway_tag.unwrap_or("<default>"),
+            minimum = CANONICAL_URL_MIN_GATEWAY,
+            "canonical URL not enforced: the gateway image predates \
+             server.canonical_url, so the instance answers on every hostname; \
+             move it to a newer image"
+        );
+        return;
+    }
+    let server = ensure_path(config, &["gateway", "server"]);
+    if !server.is_object() {
+        *server = serde_json::json!({});
+    }
+    server.as_object_mut().expect("just ensured object").insert(
+        "canonical_url".to_owned(),
+        serde_json::Value::String(url.to_owned()),
+    );
 }
 
 /// Render an `MCPGRevocationList` into the
@@ -2241,6 +2295,28 @@ mod tests {
         );
     }
 
+    /// `ServerConfig` is `deny_unknown_fields`, so stamping the key into an
+    /// older image's config is not a degraded feature — it is a pod that never
+    /// parses its config and crash-loops. Withholding it leaves the instance
+    /// answering on every hostname, which is what it did before the key
+    /// existed.
+    #[test]
+    fn inject_canonical_url_withholds_the_key_from_an_older_gateway() {
+        let mut cfg = serde_json::json!({});
+        inject_canonical_url(&mut cfg, "https://mcp.acme.com/mcp", Some("0.1.0-beta.43"));
+        assert!(
+            cfg.get("gateway").is_none(),
+            "an older gateway must receive no canonical_url at all"
+        );
+
+        inject_canonical_url(&mut cfg, "https://mcp.acme.com/mcp", Some("0.1.0-beta.44"));
+        assert_eq!(
+            cfg["gateway"]["server"]["canonical_url"],
+            serde_json::json!("https://mcp.acme.com/mcp"),
+            "the release that introduced the key must receive it"
+        );
+    }
+
     /// A gateway older than the key's first release is never handed
     /// `additional_resources` — it would refuse the whole config — and a
     /// published list is still stripped; the canonical `resource` is
@@ -2297,6 +2373,54 @@ mod tests {
         );
     }
 
+    /// A canonical URL replaces the platform address as the advertised
+    /// resource, stamps `server.canonical_url` so every other name redirects,
+    /// and advertises nothing else — a host a client is sent away from cannot
+    /// be a resource.
+    #[test]
+    fn canonical_url_becomes_the_only_advertised_identity() {
+        let gw = MCPGGateway::new(
+            "edge-1",
+            mcpg_operator_api::v1alpha1::MCPGGatewaySpec {
+                cloud: Some(mcpg_operator_api::v1alpha1::GatewayCloud {
+                    org_slug: "acme".into(),
+                    instance_slug: "edge-1".into(),
+                    external_url: "https://edge-1.mcpg.cloud/mcp".into(),
+                    canonical_url: Some("https://mcp.acme.com/mcp".into()),
+                    custom_domains: vec!["mcp.acme.com".into()],
+                }),
+                ..Default::default()
+            },
+        );
+        let cloud = gw.spec.cloud.as_ref().unwrap();
+        let canonical = cloud.canonical_url.as_deref().unwrap();
+
+        let mut cfg = serde_json::json!({});
+        inject_resource_metadata(&mut cfg, canonical, &[], Some("0.1.0-beta.44"));
+        inject_canonical_url(&mut cfg, canonical, Some("0.1.0-beta.44"));
+
+        let rm = &cfg["governance"]["access"]["resource_metadata"];
+        assert_eq!(
+            rm["resource"],
+            serde_json::json!("https://mcp.acme.com/mcp")
+        );
+        assert!(
+            rm.get("additional_resources").is_none(),
+            "the platform address redirects, so it is not a second resource"
+        );
+        assert_eq!(
+            cfg["gateway"]["server"]["canonical_url"],
+            serde_json::json!("https://mcp.acme.com/mcp")
+        );
+
+        // Still a config the gateway accepts.
+        let yaml = serde_yaml::to_string(&cfg).expect("serialize config");
+        mcpg::config::AppConfig::load_from_yaml_str(&yaml)
+            .expect("rendered cloud config must deserialise into AppConfig")
+            .validate()
+            .expect("rendered cloud config must pass AppConfig::validate");
+    }
+
     /// The injected key must map to a real snake_case `AppConfig` field, or the
     /// rendered ConfigMap would panic the pod at boot under `deny_unknown_fields`.
     /// Round-trip the operator's output through the gateway's own loader.
@@ -2334,6 +2458,7 @@ mod tests {
                     instance_slug: "edge-1".into(),
                     external_url: "https://edge-1.mcpg.cloud/mcp".into(),
                     custom_domains: Vec::new(),
+                    canonical_url: None,
                 }),
                 ..Default::default()
             },

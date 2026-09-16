@@ -639,6 +639,7 @@ mod tests {
             instance_slug: "edge-1".into(),
             external_url: "https://edge-1.mcpg.cloud/mcp".into(),
             custom_domains: vec!["mcp.acme.com".into()],
+            canonical_url: None,
         }
     }
 
