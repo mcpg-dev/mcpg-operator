@@ -34,8 +34,8 @@ pub use managed_nats::{
 pub use pdb::build_pdb;
 pub use plugin_render::{
     CLOUD_PLUGIN_OCI_BASE, REVOCATION_LIST_MOUNT_PATH, ResolvedSetEntry, ResolvedSetView,
-    append_cloud_default_plugins, append_observability_sink_plugins, cloud_default_plugin_ids,
-    merge_plugins,
+    append_cloud_default_plugins, append_cluster_coordinator_plugin,
+    append_observability_sink_plugins, cloud_default_plugin_ids, merge_plugins,
 };
 pub use server::{build_server_deployment, build_server_service, server_child_name};
 pub use service::build_service;

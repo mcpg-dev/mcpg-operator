@@ -221,8 +221,8 @@ pub fn append_cloud_default_plugins(config: &mut Value, ids: &[String]) {
     }
 }
 
-/// Observability sink plugins the published gateway images bake, paired
-/// with the `class` each descriptor declares.
+/// Observability sink plugins the plugin registry publishes, paired with
+/// the `class` each descriptor declares.
 ///
 /// A sink is selected by plugin id in `observability.<signal>.sinks[].kind`,
 /// but selecting it does not load it: the cdylib still needs a `plugins[]`
@@ -234,7 +234,7 @@ pub fn append_cloud_default_plugins(config: &mut Value, ids: &[String]) {
 /// from one that was never appended — the host refuses an under-granted plugin
 /// at boot, so the gateway does not start at all rather than starting without
 /// telemetry.
-const BAKED_SINK_PLUGINS: &[(&str, &str, &[&str])] = &[
+const FIRST_PARTY_SINK_PLUGINS: &[(&str, &str, &[&str])] = &[
     ("dev.mcpg.observability.prometheus", "metrics_sink", &[]),
     (
         "dev.mcpg.observability.otlp",
@@ -325,15 +325,15 @@ fn configured_sink_kinds(config: &Value) -> Vec<String> {
 
 /// Give every configured first-party sink the `plugins[]` entry that loads it.
 ///
-/// Only ids in [`BAKED_SINK_PLUGINS`] are added. An entry whose `source.path`
-/// names an artifact the image does not carry fails gateway boot, so a
-/// third-party sink stays the config author's responsibility — the operator
-/// cannot know where its cdylib lives.
+/// Only ids in [`FIRST_PARTY_SINK_PLUGINS`] are added. An entry whose source
+/// does not resolve fails gateway boot, so a third-party sink stays the
+/// config author's responsibility — the operator cannot know where its
+/// cdylib lives.
 pub fn append_observability_sink_plugins(config: &mut Value) {
     let wanted: Vec<(&str, &str, &[&str])> = configured_sink_kinds(config)
         .into_iter()
         .filter_map(|kind| {
-            BAKED_SINK_PLUGINS
+            FIRST_PARTY_SINK_PLUGINS
                 .iter()
                 .find(|(id, _, _)| *id == kind)
                 .copied()
@@ -360,6 +360,58 @@ pub fn append_observability_sink_plugins(config: &mut Value) {
         }
         push_plugin_entry(config, entry);
     }
+}
+
+/// Cluster coordinators the plugin registry publishes, keyed by the
+/// `cluster.kind` that selects each: the id the gateway resolves by its
+/// `dev.mcpg.cluster.<kind>` convention, and the grants the descriptor
+/// declares under `required_capabilities` (both coordinators dial their
+/// broker over raw TCP).
+const FIRST_PARTY_CLUSTER_COORDINATORS: &[(&str, &str, &[&str])] = &[
+    ("nats", "dev.mcpg.cluster.nats", &["network_outbound"]),
+    ("redis", "dev.mcpg.cluster.redis", &["network_outbound"]),
+];
+
+/// Give a configured first-party cluster coordinator the `plugins[]` entry
+/// that loads it.
+///
+/// `cluster.kind` selects a coordinator the same way a sink is selected:
+/// by id convention, without loading anything. The gateway links no
+/// coordinator statically and refuses to boot a kind whose cdylib no entry
+/// loads, so the multi-replica block the provisioner renders needs this
+/// entry beside it. `single_node` (and no block at all) is the in-process
+/// default and needs nothing; a kind outside
+/// [`FIRST_PARTY_CLUSTER_COORDINATORS`] stays the config author's
+/// responsibility, and an existing entry naming the id (under `id` or
+/// `ref`) wins — a second entry would register a duplicate alias and fail
+/// boot.
+pub fn append_cluster_coordinator_plugin(config: &mut Value) {
+    let Some(kind) = config
+        .get("cluster")
+        .and_then(|c| c.get("kind"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    let Some((_, id, grants)) = FIRST_PARTY_CLUSTER_COORDINATORS
+        .iter()
+        .find(|(k, _, _)| *k == kind)
+    else {
+        return;
+    };
+    if plugin_ids(config).contains(*id) {
+        return;
+    }
+    let mut entry = json!({
+        "id": id,
+        "kind": "native",
+        "class": "cluster",
+        "source": { "oci": plugin_oci_ref(id) },
+    });
+    if !grants.is_empty() {
+        entry["granted_capabilities"] = json!(grants);
+    }
+    push_plugin_entry(config, entry);
 }
 
 /// Ids already claimed by an entry, under either key the gateway accepts.
@@ -1216,5 +1268,95 @@ mod tests {
         append_observability_sink_plugins(&mut config);
         assert_eq!(config["plugins"][0]["id"], "dev.mcpg.observability.otlp");
         assert_eq!(config["plugins"][0]["class"], "telemetry_sink");
+    }
+
+    fn with_cluster(kind: &str) -> Value {
+        json!({
+            "gateway": { "server": { "bind_address": "0.0.0.0:8787" } },
+            "cluster": { "kind": kind, "servers": ["nats://nats.cell.svc:4222"] },
+        })
+    }
+
+    /// The entry must satisfy the gateway's own parser and validator, and
+    /// carry the grant the descriptor requires: without `network_outbound`
+    /// the host refuses the coordinator and the whole instance stays down.
+    #[test]
+    fn configured_coordinator_gets_a_loadable_entry() {
+        let mut config = with_cluster("nats");
+        append_cluster_coordinator_plugin(&mut config);
+        let cfg: mcpg::config::AppConfig =
+            serde_json::from_value(config).expect("coordinator entry deserialises into AppConfig");
+        let coordinator = cfg
+            .plugins
+            .iter()
+            .find(|p| p.id == "dev.mcpg.cluster.nats")
+            .expect("coordinator plugin entry present");
+        assert_eq!(coordinator.class, "cluster");
+        assert_eq!(
+            coordinator.source.oci.as_deref(),
+            Some("ghcr.io/mcpg-dev/plugins/cluster-nats:protocol-1")
+        );
+        assert_eq!(
+            coordinator.granted_capabilities,
+            vec![mcpg_plugin_protocol::capability::Capability::NetworkOutbound]
+        );
+        mcpg::config::validate_plugins(&cfg.plugins)
+            .expect("rendered coordinator entry must pass the gateway's plugins[] validator");
+    }
+
+    #[test]
+    fn redis_coordinator_resolves_by_the_same_convention() {
+        let mut config = with_cluster("redis");
+        append_cluster_coordinator_plugin(&mut config);
+        assert_eq!(config["plugins"][0]["id"], "dev.mcpg.cluster.redis");
+        assert_eq!(
+            config["plugins"][0]["source"]["oci"],
+            "ghcr.io/mcpg-dev/plugins/cluster-redis:protocol-1"
+        );
+    }
+
+    /// An author's own row wins, under either key the gateway accepts.
+    #[test]
+    fn existing_coordinator_entry_is_not_duplicated() {
+        let mut config = with_cluster("nats");
+        config["plugins"] = json!([{
+            "id": "dev.mcpg.cluster.nats",
+            "kind": "native",
+            "class": "cluster",
+            "source": { "oci": "registry.example/cluster-nats:1" },
+        }]);
+        append_cluster_coordinator_plugin(&mut config);
+        assert_eq!(config["plugins"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            config["plugins"][0]["source"]["oci"],
+            "registry.example/cluster-nats:1"
+        );
+
+        let mut config = with_cluster("nats");
+        config["plugins"] = json!([{
+            "id": "coordinator",
+            "ref": "dev.mcpg.cluster.nats",
+            "kind": "native",
+            "class": "cluster",
+            "source": { "path": "/somewhere/else/plugin.so" },
+        }]);
+        append_cluster_coordinator_plugin(&mut config);
+        assert_eq!(config["plugins"].as_array().unwrap().len(), 1);
+    }
+
+    /// `single_node` is the in-process default, an unknown kind is the
+    /// author's, and a config without a `cluster` block needs nothing.
+    #[test]
+    fn coordinator_pass_leaves_other_configs_untouched() {
+        for mut config in [
+            with_cluster("single_node"),
+            with_cluster("acme-etcd"),
+            json!({ "gateway": {} }),
+            json!({ "cluster": "broken" }),
+        ] {
+            let before = config.clone();
+            append_cluster_coordinator_plugin(&mut config);
+            assert_eq!(config, before);
+        }
     }
 }

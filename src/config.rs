@@ -153,13 +153,14 @@ pub struct OperatorConfig {
 
     /// Comma-separated plugin ids the gateway controller injects as
     /// `plugins[]` entries into every MANAGED-CLOUD gateway config
-    /// (`spec.cloud` set), pointing at the backend cdylibs baked into
-    /// the published gateway images under
-    /// `/usr/local/lib/mcpg/plugins/<id>/plugin.so`. Unset = the
-    /// standard first-party backend set; an explicitly empty value
-    /// disables the injection. Self-host CRs never receive these
-    /// entries — their image may not carry the artifacts, and the
-    /// gateway refuses to boot on a missing `source.path`.
+    /// (`spec.cloud` set). Each entry fetches
+    /// `ghcr.io/mcpg-dev/plugins/<name>` at the operator's default plugin
+    /// version (`MCPG_DEFAULT_PLUGIN_VERSION`) — the published gateway
+    /// images bundle no plugins. Unset = the standard first-party backend
+    /// set; an explicitly empty value disables the injection. The loader
+    /// entries for a configured sink or cluster coordinator are rendered
+    /// regardless of this setting. Self-host CRs never receive any of
+    /// them — where their plugins come from is their author's decision.
     #[arg(long, env = "MCPG_OPERATOR_CLOUD_DEFAULT_PLUGINS")]
     pub cloud_default_plugins: Option<String>,
 

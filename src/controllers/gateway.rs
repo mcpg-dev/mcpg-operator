@@ -55,9 +55,10 @@ use crate::reconcile::{
 use crate::telemetry::{MetricsRegistry, ReconcileOutcome};
 use crate::templates::{
     HTTPRoute, PluginSecretMount, REVOCATION_LIST_MOUNT_PATH, ResolvedSetEntry, ResolvedSetView,
-    RevocationListMount, append_cloud_default_plugins, append_observability_sink_plugins,
-    build_configmap, build_deployment, build_hpa, build_httproute, build_pdb, build_service,
-    build_service_account, child_name, cloud_default_plugin_ids, merge_plugins, owner_ref,
+    RevocationListMount, append_cloud_default_plugins, append_cluster_coordinator_plugin,
+    append_observability_sink_plugins, build_configmap, build_deployment, build_hpa,
+    build_httproute, build_pdb, build_service, build_service_account, child_name,
+    cloud_default_plugin_ids, merge_plugins, owner_ref,
 };
 use crate::{FIELD_MANAGER_PREFIX, labels as label_keys};
 
@@ -2124,15 +2125,19 @@ async fn reconcile_edge_domains(
     Ok(())
 }
 
-/// Managed-cloud only: append the standard backend plugin entries
-/// (image-baked cdylibs) to the rendered config so tenant `tools/call`
-/// dispatch has its backends registered — the gateway binary links no
-/// backends statically. Composes with plugin-set / hand-listed entries
-/// (an existing `id`/`ref` suppresses the matching default); the id
-/// list comes from MCPG_OPERATOR_CLOUD_DEFAULT_PLUGINS (unset =
-/// standard set, empty = disabled). Self-host CRs are left untouched —
-/// their image may not carry the artifacts, and a missing
-/// `source.path` fails gateway boot.
+/// Managed-cloud only: give the rendered config every first-party plugin
+/// entry the platform owes it — the standard backends so tenant
+/// `tools/call` dispatch has its backends registered (the gateway binary
+/// links none statically), the loader entry for each configured sink,
+/// and the loader entry for the cluster coordinator the provisioner's
+/// `cluster` block selects. Every entry fetches from the public plugin
+/// registry at the operator's default plugin version. Composes with
+/// plugin-set / hand-listed entries (an existing `id`/`ref` suppresses
+/// the matching default); the backend id list comes from
+/// MCPG_OPERATOR_CLOUD_DEFAULT_PLUGINS (unset = standard set, empty =
+/// disabled). Self-host CRs are left untouched — where their plugins
+/// come from is their author's decision, and an entry whose source does
+/// not resolve fails gateway boot.
 fn apply_cloud_default_plugins(
     obj: &MCPGGateway,
     override_csv: Option<&str>,
@@ -2164,9 +2169,13 @@ fn apply_cloud_default_plugins(
         );
     }
     // Selecting a sink does not load it. Same reasoning as the backends
-    // above, and the same image: without the entry the signal is configured
-    // and silently never exported.
+    // above: without the entry the signal is configured and silently never
+    // exported.
     append_observability_sink_plugins(merged_config);
+    // Same again for the coordinator a multi-replica instance's `cluster`
+    // block selects — except that here the gateway refuses to boot rather
+    // than losing a signal.
+    append_cluster_coordinator_plugin(merged_config);
 }
 
 /// Finalizer-path cleanup for [`reconcile_edge_domains`]: relinquish this CR's
@@ -2541,14 +2550,50 @@ mod tests {
 
     #[test]
     fn self_host_cr_gets_no_default_backend_entries() {
-        // A self-host image may not carry the baked cdylibs, and a
-        // missing source.path fails gateway boot — the config must
-        // pass through byte-identical.
+        // Where a self-host gateway's plugins come from is its author's
+        // decision — the config must pass through byte-identical, even
+        // when it selects a coordinator the registry publishes.
         let gw = gw_cloudness(false);
-        let mut cfg = serde_json::json!({"gateway": {"server": {}}});
+        let mut cfg = serde_json::json!({
+            "gateway": {"server": {}},
+            "cluster": {"kind": "nats", "servers": ["nats://nats.internal:4222"]},
+        });
         let before = cfg.clone();
         apply_cloud_default_plugins(&gw, None, None, &mut cfg);
         assert_eq!(cfg, before);
+    }
+
+    /// The provisioner renders the multi-replica `cluster` block and the
+    /// overlay owes it the coordinator's loader entry: the gateway links no
+    /// coordinator statically and refuses to boot `cluster.kind: nats`
+    /// without one.
+    #[test]
+    fn cloud_cr_with_a_cluster_block_gets_the_coordinator_entry() {
+        let gw = gw_cloudness(true);
+        let mut cfg = serde_json::json!({
+            "cluster": {"kind": "nats", "servers": ["nats://mcpg-nats.mcpg-system.svc:4222"]},
+        });
+        apply_cloud_default_plugins(&gw, None, None, &mut cfg);
+        let entries = cfg["plugins"].as_array().expect("plugins array rendered");
+        let coordinator = entries
+            .iter()
+            .find(|e| e["id"] == "dev.mcpg.cluster.nats")
+            .expect("coordinator entry appended beside the backends");
+        assert_eq!(coordinator["class"], "cluster");
+        assert_eq!(
+            coordinator["source"]["oci"],
+            "ghcr.io/mcpg-dev/plugins/cluster-nats:protocol-1"
+        );
+        assert_eq!(
+            coordinator["granted_capabilities"],
+            serde_json::json!(["network_outbound"])
+        );
+        // Disabling the backend defaults does not disable the coordinator:
+        // the block that selects it is still there.
+        let mut cfg = serde_json::json!({ "cluster": {"kind": "nats"} });
+        apply_cloud_default_plugins(&gw, Some(""), None, &mut cfg);
+        assert_eq!(cfg["plugins"].as_array().map(Vec::len), Some(1));
+        assert_eq!(cfg["plugins"][0]["id"], "dev.mcpg.cluster.nats");
     }
 
     #[test]
