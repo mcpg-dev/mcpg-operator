@@ -53,7 +53,7 @@ use mcpg_operator_api::v1alpha1::{
     managed_nats_config_name, managed_nats_headless_service_name, managed_nats_service_name,
     managed_nats_statefulset_name, managed_nats_tls_secret_name,
 };
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 use sha2::{Digest, Sha256};
 use tracing::{error, info, instrument};
 
@@ -319,7 +319,7 @@ async fn reconcile_inner(
 /// the gateway controller's helper.
 fn jittered_resync(base_secs: u64) -> Duration {
     let base = base_secs as f64;
-    let jitter_factor = 0.8 + rand::thread_rng().gen_range(0.0..0.4);
+    let jitter_factor = 0.8 + rand::rng().random_range(0.0..0.4);
     Duration::from_secs_f64(base * jitter_factor)
 }
 
@@ -627,7 +627,7 @@ fn merge_coordination_data(
 /// source decodes back to exactly 32 bytes (the state-key requirement).
 fn gen_url_safe_key(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&buf)
 }
 

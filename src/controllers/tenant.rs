@@ -42,7 +42,7 @@ use mcpg_operator_api::v1alpha1::{
     MCPGGateway, MCPGPluginSet, MCPGRoute, MCPGTenant, MCPGTenantStatus, TenantObservedCounts,
     TenantQuotas,
 };
-use rand::Rng;
+use rand::RngExt;
 use tracing::{error, info, instrument, warn};
 
 use crate::FIELD_MANAGER_PREFIX;
@@ -471,7 +471,7 @@ fn operator_namespace() -> String {
 /// Periodic resync interval, jittered ±20%.
 fn jittered_resync(base_secs: u64) -> Duration {
     let base = base_secs as f64;
-    let jitter_factor = 0.8 + rand::thread_rng().gen_range(0.0..0.4);
+    let jitter_factor = 0.8 + rand::rng().random_range(0.0..0.4);
     Duration::from_secs_f64(base * jitter_factor)
 }
 

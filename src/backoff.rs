@@ -90,8 +90,8 @@ pub fn backoff_for_count(count: u32) -> Duration {
 }
 
 fn jitter() -> f64 {
-    use rand::Rng;
-    0.8 + rand::thread_rng().gen_range(0.0..0.4)
+    use rand::RngExt;
+    0.8 + rand::rng().random_range(0.0..0.4)
 }
 
 /// Build the per-resource key from the (controller, namespace,

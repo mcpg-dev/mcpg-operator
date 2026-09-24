@@ -329,9 +329,22 @@ mod tests {
     #[test]
     fn registry_encodes_with_metric_definitions() {
         let reg = MetricsRegistry::new();
+        // The encoder skips a labelled family until it holds a sample
+        // (as the Go client does); an unlabelled metric is always present.
+        let empty = reg.encode();
+        assert!(
+            !empty.contains("mcpg_operator_reconcile"),
+            "unsampled family encoded: {empty}"
+        );
+        assert!(
+            empty.contains("mcpg_operator_oci_pull_duration_seconds"),
+            "expected unlabelled histogram: {empty}"
+        );
+
+        let m = reg.operator_metrics();
+        m.observe_reconcile("gateway", ReconcileOutcome::Success, 0.1);
+        m.observe_dependency_unresolved("gateway", "MCPGPluginSet", "PluginSetNotReady");
         let text = reg.encode();
-        // Metric definitions land in the encoded output even
-        // when no samples have been recorded yet.
         assert!(
             text.contains("mcpg_operator_reconcile"),
             "expected reconcile metric definition: {text}"
