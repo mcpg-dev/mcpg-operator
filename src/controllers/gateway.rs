@@ -98,6 +98,15 @@ mod cluster_reason {
     pub const SINGLE_NODE_BACKEND: &str = "SingleNodeBackend";
 }
 
+/// Reasons surfaced on
+/// `MCPGGateway.status.conditions[AuthorizationServerAligned]`.
+mod authorization_server_reason {
+    pub const ALIGNED: &str = "MatchesAdvertisedIdentity";
+    pub const ISSUER_NOT_BARE_ORIGIN: &str = "IssuerNotBareOrigin";
+    pub const ISSUER_ORIGIN_MISMATCH: &str = "IssuerOriginMismatch";
+    pub const RESOURCE_MISMATCH: &str = "ResourceMismatch";
+}
+
 /// Condition type names emitted by this controller (in addition
 /// to the `Ready` / `Progressing` / `Available` types from the
 /// shared `conditions` module).
@@ -105,6 +114,11 @@ mod cond_types {
     pub const PLUGIN_SET_READY: &str = "PluginSetReady";
     pub const REVOCATION_LIST_READY: &str = "RevocationListReady";
     pub const CLUSTER_READY: &str = "ClusterReady";
+    /// Managed-cloud only, and only while the config carries
+    /// `governance.access.authorization_server`: whether its issuer and
+    /// resource name an identity this instance is advertised at. Advisory —
+    /// it never holds the reconcile or flips `Ready`.
+    pub const AUTHORIZATION_SERVER_ALIGNED: &str = "AuthorizationServerAligned";
 }
 
 /// The gateway controller's view of a successfully resolved
@@ -637,6 +651,15 @@ async fn reconcile_inner(
             inject_canonical_url(&mut merged_config, advertised, Some(gateway_tag));
         }
     }
+    // Read from the rendered config, so it judges the identities the gateway
+    // will actually advertise. Managed-cloud only: there the edge routes this
+    // instance's own hostnames and nothing else.
+    let authorization_server_condition = obj
+        .spec
+        .cloud
+        .as_ref()
+        .filter(|cloud| !cloud.external_url.is_empty())
+        .and_then(|_| authorization_server_alignment(&merged_config));
     apply_cloud_default_plugins(
         &obj,
         ctx.config.cloud_default_plugins.as_deref(),
@@ -820,6 +843,14 @@ async fn reconcile_inner(
         cond.observed_generation = Some(observed_generation);
         mcpg_operator_api::conditions::set_condition(&mut conditions, cond);
     }
+    match &authorization_server_condition {
+        Some(c) => {
+            let mut cond = c.clone();
+            cond.observed_generation = Some(observed_generation);
+            mcpg_operator_api::conditions::set_condition(&mut conditions, cond);
+        }
+        None => conditions.retain(|c| c.r#type != cond_types::AUTHORIZATION_SERVER_ALIGNED),
+    }
 
     let status = MCPGGatewayStatus {
         conditions,
@@ -839,6 +870,34 @@ async fn reconcile_inner(
     if let Err(e) = patch_status(&api, &name, &status, &fm).await {
         // Status updates are best-effort — log + continue.
         warn!(error = ?e, "status patch failed");
+    }
+
+    if let Some(c) = authorization_server_condition
+        .as_ref()
+        .filter(|c| c.status != "True")
+    {
+        warn!(
+            namespace = %ns,
+            gateway = %name,
+            reason = %c.reason,
+            "{}",
+            c.message
+        );
+        let evt = K8sEvent {
+            type_: EventType::Warning,
+            reason: c.reason.clone(),
+            note: Some(c.message.clone()),
+            action: "CheckAuthorizationServer".into(),
+            secondary: None,
+        };
+        if let Err(e) = ctx
+            .recorders
+            .gateway
+            .publish(&evt, &obj.object_ref(&()))
+            .await
+        {
+            warn!(error = ?e, "gateway: failed to publish authorization-server event");
+        }
     }
 
     // Emit a Normal event when this reconcile flipped the gateway
@@ -1963,6 +2022,160 @@ fn inject_canonical_url(config: &mut serde_json::Value, url: &str, gateway_tag: 
     );
 }
 
+/// Judge the tenant's `governance.access.authorization_server` against the
+/// resource identifiers the rendered config advertises
+/// (`resource_metadata.resource` plus `additional_resources`, as stamped by
+/// [`inject_resource_metadata`]). Enterprise IdPs bind every ID-JAG to the
+/// issuer string and MCP clients request them for the advertised resource,
+/// so an issuer the gateway refuses as not a bare origin, one on an origin
+/// the edge does not route to this instance, or a `resource` no client is
+/// told about, fails redemptions with nothing pointing at the cause. `None` when there is no such block, when the
+/// issuer still carries a `${…}` placeholder the gateway resolves at load,
+/// or when the config advertises no resource to compare against.
+fn authorization_server_alignment(rendered: &serde_json::Value) -> Option<Condition> {
+    let authz = rendered
+        .pointer("/governance/access/authorization_server")
+        .filter(|v| v.is_object())?;
+    let issuer = authz
+        .get("issuer")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| !v.contains("${"))?;
+
+    let rm = rendered.pointer("/governance/access/resource_metadata");
+    let advertised: Vec<&str> = rm
+        .and_then(|rm| rm.get("resource"))
+        .and_then(serde_json::Value::as_str)
+        .into_iter()
+        .chain(
+            rm.and_then(|rm| rm.get("additional_resources"))
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str),
+        )
+        .collect();
+    let mut origins: Vec<String> = Vec::new();
+    for origin in advertised.iter().filter_map(|r| url_origin(r)) {
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+    // The first entry is `resource_metadata.resource`: the canonical URL when
+    // one is set, else the platform address.
+    let preferred = origins.first()?;
+
+    // The tenant's issuer and resource are never echoed whole: they may carry
+    // userinfo, and this message lands in events and logs.
+    let mut problems: Vec<(&'static str, String)> = Vec::new();
+    if url_origin(issuer).is_some() && !is_bare_origin_issuer(issuer) {
+        problems.push((
+            authorization_server_reason::ISSUER_NOT_BARE_ORIGIN,
+            format!(
+                "governance.access.authorization_server.issuer must be a bare origin, \
+                 scheme://host[:port] with a lower-case http or https scheme and no userinfo, \
+                 path, query or fragment (a trailing / is allowed), or the gateway refuses the \
+                 configuration; set it to {preferred}"
+            ),
+        ));
+    }
+    match url_origin(issuer) {
+        Some(origin) if origins.contains(&origin) => {}
+        Some(origin) => problems.push((
+            authorization_server_reason::ISSUER_ORIGIN_MISMATCH,
+            format!(
+                "governance.access.authorization_server.issuer is on origin {origin}, which \
+                 this instance is not served at (served at: {}); set it to {preferred} and \
+                 register that exact value as the audience at the enterprise IdP",
+                origins.join(", "),
+            ),
+        )),
+        None => problems.push((
+            authorization_server_reason::ISSUER_ORIGIN_MISMATCH,
+            format!(
+                "governance.access.authorization_server.issuer is not an absolute http(s) \
+                 URL; set it to {preferred}"
+            ),
+        )),
+    }
+    if let Some(resource) = authz
+        .get("resource")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| !v.trim().is_empty() && !v.contains("${"))
+    {
+        let wanted = resource.trim_end_matches('/');
+        if !advertised.iter().any(|r| r.trim_end_matches('/') == wanted) {
+            problems.push((
+                authorization_server_reason::RESOURCE_MISMATCH,
+                format!(
+                    "governance.access.authorization_server.resource is not a resource this \
+                     instance advertises (advertised: {}); an ID-JAG that names no resource \
+                     gets a token for it, an audience no client was told about, so remove the \
+                     key to use the advertised one",
+                    advertised.join(", "),
+                ),
+            ));
+        }
+    }
+
+    Some(match problems.first() {
+        None => Condition::new(
+            cond_types::AUTHORIZATION_SERVER_ALIGNED,
+            "True",
+            authorization_server_reason::ALIGNED,
+            "",
+            None,
+        ),
+        Some((reason, _)) => Condition::new(
+            cond_types::AUTHORIZATION_SERVER_ALIGNED,
+            "False",
+            *reason,
+            problems
+                .iter()
+                .map(|(_, message)| message.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+            None,
+        ),
+    })
+}
+
+/// Whether `issuer` has the shape the gateway accepts for
+/// `authorization_server.issuer`: `http://` or `https://` in lower case, a
+/// host, and no userinfo, path, query or fragment beyond a trailing `/`.
+fn is_bare_origin_issuer(issuer: &str) -> bool {
+    let Some(authority) = issuer
+        .strip_prefix("https://")
+        .or_else(|| issuer.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = authority.strip_suffix('/').unwrap_or(authority);
+    !authority.is_empty()
+        && !authority.starts_with(':')
+        && !authority.contains(['/', '?', '#', '@'])
+}
+
+/// `scheme://host[:port]` of an absolute `http(s)` URL: lowercased, without
+/// userinfo, and without the scheme's default port — the part that decides
+/// which edge listener answers it. `None` for any other input.
+fn url_origin(url: &str) -> Option<String> {
+    let (scheme, rest) = url.trim().split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "https" => ":443",
+        "http" => ":80",
+        _ => return None,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host)
+        .to_ascii_lowercase();
+    let host_port = host_port.strip_suffix(default_port).unwrap_or(&host_port);
+    (!host_port.is_empty() && !host_port.starts_with(':'))
+        .then(|| format!("{scheme}://{host_port}"))
+}
+
 /// Render an `MCPGRevocationList` into the
 /// `RevocationListFile` JSON shape the gateway's
 /// `mcpg_plugin_host::revocation` parser consumes. The hash
@@ -2453,6 +2666,315 @@ mod tests {
         parsed
             .validate()
             .expect("rendered cloud config must pass AppConfig::validate");
+    }
+
+    // ── Embedded authorization server vs the advertised identity ─
+
+    /// The config the reconcile renders for managed instance `edge-1`,
+    /// carrying the tenant's `authorization_server` block.
+    fn rendered_cloud_config(
+        authorization_server: serde_json::Value,
+        canonical_url: Option<&str>,
+        custom_domains: &[&str],
+    ) -> serde_json::Value {
+        let mut cfg = serde_json::json!({
+            "governance": { "access": { "authorization_server": authorization_server }}
+        });
+        let domains: Vec<String> = custom_domains.iter().map(|d| (*d).to_owned()).collect();
+        let advertised = canonical_url.unwrap_or("https://edge-1.mcpg.cloud/mcp");
+        let also_serving: &[String] = if canonical_url.is_some() {
+            &[]
+        } else {
+            &domains
+        };
+        inject_resource_metadata(&mut cfg, advertised, also_serving, None);
+        if canonical_url.is_some() {
+            inject_canonical_url(&mut cfg, advertised, None);
+        }
+        cfg
+    }
+
+    fn alignment_for_issuer(issuer: &str) -> Condition {
+        authorization_server_alignment(&rendered_cloud_config(
+            serde_json::json!({ "issuer": issuer }),
+            None,
+            &[],
+        ))
+        .expect("an authorization_server block yields a condition")
+    }
+
+    #[test]
+    fn an_issuer_on_the_advertised_origin_is_aligned() {
+        for issuer in [
+            "https://edge-1.mcpg.cloud",
+            "https://edge-1.mcpg.cloud/",
+            "https://Edge-1.MCPG.cloud:443",
+        ] {
+            let c = alignment_for_issuer(issuer);
+            assert_eq!(c.r#type, cond_types::AUTHORIZATION_SERVER_ALIGNED);
+            assert_eq!(c.status, "True", "{issuer}: {}", c.message);
+            assert_eq!(c.reason, authorization_server_reason::ALIGNED);
+            assert!(c.message.is_empty());
+        }
+    }
+
+    /// The gateway refuses an issuer that is not a bare origin, so one on
+    /// the right origin is still not aligned: the pod would not load it.
+    #[test]
+    fn an_issuer_the_gateway_refuses_is_not_aligned() {
+        for issuer in [
+            "HTTPS://edge-1.mcpg.cloud",
+            "https://edge-1.mcpg.cloud/oauth",
+            "https://edge-1.mcpg.cloud//",
+            "https://edge-1.mcpg.cloud?tenant=a",
+            "https://admin@edge-1.mcpg.cloud",
+        ] {
+            let c = alignment_for_issuer(issuer);
+            assert_eq!(c.status, "False", "{issuer}");
+            assert_eq!(
+                c.reason,
+                authorization_server_reason::ISSUER_NOT_BARE_ORIGIN,
+                "{issuer}"
+            );
+            assert!(
+                c.message.contains("set it to https://edge-1.mcpg.cloud"),
+                "{}",
+                c.message
+            );
+            assert!(!c.message.contains("admin"), "{}", c.message);
+        }
+    }
+
+    /// Another host, another scheme or another port is a listener the edge
+    /// does not route to this instance: the condition says so and names the
+    /// origin to use.
+    #[test]
+    fn an_issuer_on_any_other_origin_is_flagged() {
+        for (issuer, origin) in [
+            ("https://auth.example.com", "https://auth.example.com"),
+            ("http://edge-1.mcpg.cloud", "http://edge-1.mcpg.cloud"),
+            (
+                "https://edge-1.mcpg.cloud:8443",
+                "https://edge-1.mcpg.cloud:8443",
+            ),
+            ("https://edge-2.mcpg.cloud", "https://edge-2.mcpg.cloud"),
+        ] {
+            let c = alignment_for_issuer(issuer);
+            assert_eq!(c.status, "False", "{issuer}");
+            assert_eq!(
+                c.reason,
+                authorization_server_reason::ISSUER_ORIGIN_MISMATCH
+            );
+            assert!(
+                c.message.contains(&format!("on origin {origin},")),
+                "{}",
+                c.message
+            );
+            assert!(
+                c.message.contains("set it to https://edge-1.mcpg.cloud "),
+                "{}",
+                c.message
+            );
+        }
+        let c = alignment_for_issuer("edge-1.mcpg.cloud");
+        assert_eq!(c.status, "False");
+        assert!(
+            c.message.contains("not an absolute http(s) URL"),
+            "{}",
+            c.message
+        );
+    }
+
+    /// With a canonical URL every other name redirects, so the platform
+    /// address is no longer an origin the issuer may name.
+    #[test]
+    fn with_a_canonical_url_only_its_origin_is_served() {
+        let rendered = |issuer: &str| {
+            rendered_cloud_config(
+                serde_json::json!({ "issuer": issuer }),
+                Some("https://mcp.acme.com/mcp"),
+                &["mcp.acme.com"],
+            )
+        };
+        let c = authorization_server_alignment(&rendered("https://mcp.acme.com")).unwrap();
+        assert_eq!(c.status, "True", "{}", c.message);
+
+        let c = authorization_server_alignment(&rendered("https://edge-1.mcpg.cloud")).unwrap();
+        assert_eq!(c.status, "False");
+        assert!(
+            c.message.contains("served at: https://mcp.acme.com)"),
+            "{}",
+            c.message
+        );
+        assert!(
+            c.message.contains("set it to https://mcp.acme.com "),
+            "{}",
+            c.message
+        );
+    }
+
+    /// Without a canonical URL the instance answers on every bound custom
+    /// domain as well, and the edge forwards `/oauth` and `/.well-known` on
+    /// each of them.
+    #[test]
+    fn without_a_canonical_url_a_bound_custom_domain_is_served() {
+        let rendered = |issuer: &str| {
+            rendered_cloud_config(
+                serde_json::json!({ "issuer": issuer }),
+                None,
+                &["mcp.acme.com"],
+            )
+        };
+        let c = authorization_server_alignment(&rendered("https://mcp.acme.com")).unwrap();
+        assert_eq!(c.status, "True", "{}", c.message);
+
+        let c = authorization_server_alignment(&rendered("https://tools.acme.com")).unwrap();
+        assert_eq!(c.status, "False");
+        assert!(
+            c.message
+                .contains("served at: https://edge-1.mcpg.cloud, https://mcp.acme.com)"),
+            "{}",
+            c.message
+        );
+        assert!(
+            c.message.contains("set it to https://edge-1.mcpg.cloud "),
+            "the platform address is the preferred origin: {}",
+            c.message
+        );
+    }
+
+    #[test]
+    fn an_explicit_resource_must_be_one_the_instance_advertises() {
+        let rendered = |resource: &str| {
+            rendered_cloud_config(
+                serde_json::json!({
+                    "issuer": "https://edge-1.mcpg.cloud",
+                    "resource": resource,
+                }),
+                None,
+                &["mcp.acme.com"],
+            )
+        };
+        for ok in [
+            "https://edge-1.mcpg.cloud/mcp",
+            "https://edge-1.mcpg.cloud/mcp/",
+            "https://mcp.acme.com/mcp",
+        ] {
+            let c = authorization_server_alignment(&rendered(ok)).unwrap();
+            assert_eq!(c.status, "True", "{ok}: {}", c.message);
+        }
+        let c =
+            authorization_server_alignment(&rendered("https://edge-1.mcpg.cloud/other")).unwrap();
+        assert_eq!(c.status, "False");
+        assert_eq!(c.reason, authorization_server_reason::RESOURCE_MISMATCH);
+        assert!(
+            c.message
+                .contains("advertised: https://edge-1.mcpg.cloud/mcp, https://mcp.acme.com/mcp)"),
+            "{}",
+            c.message
+        );
+        assert!(c.message.contains("remove the key"), "{}", c.message);
+    }
+
+    /// Both problems are reported at once; the reason names the issuer, the
+    /// one an IdP administrator has to change as well.
+    #[test]
+    fn issuer_and_resource_problems_are_reported_together() {
+        let c = authorization_server_alignment(&rendered_cloud_config(
+            serde_json::json!({
+                "issuer": "https://auth.example.com",
+                "resource": "https://auth.example.com/mcp",
+            }),
+            None,
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(c.status, "False");
+        assert_eq!(
+            c.reason,
+            authorization_server_reason::ISSUER_ORIGIN_MISMATCH
+        );
+        assert!(c.message.contains(".issuer is on origin"), "{}", c.message);
+        assert!(
+            c.message.contains(".resource is not a resource"),
+            "{}",
+            c.message
+        );
+    }
+
+    /// The message reaches events and logs, so the tenant's strings are
+    /// reduced to origins and never carry credentials along.
+    #[test]
+    fn the_message_never_echoes_userinfo() {
+        let c = authorization_server_alignment(&rendered_cloud_config(
+            serde_json::json!({
+                "issuer": "https://admin:hunter2@auth.example.com/path",
+                "resource": "https://admin:hunter2@auth.example.com/mcp",
+            }),
+            None,
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(c.status, "False");
+        assert!(!c.message.contains("hunter2"), "{}", c.message);
+        assert!(!c.message.contains("admin"), "{}", c.message);
+        assert!(
+            c.message.contains("on origin https://auth.example.com,"),
+            "{}",
+            c.message
+        );
+    }
+
+    /// No block, a null block, an issuer the gateway resolves only at load,
+    /// or nothing advertised to compare with: there is nothing to judge.
+    #[test]
+    fn no_condition_without_something_to_compare() {
+        let mut cfg = serde_json::json!({});
+        inject_resource_metadata(&mut cfg, "https://edge-1.mcpg.cloud/mcp", &[], None);
+        assert!(authorization_server_alignment(&cfg).is_none());
+
+        let null_block = rendered_cloud_config(serde_json::Value::Null, None, &[]);
+        assert!(authorization_server_alignment(&null_block).is_none());
+
+        let placeholder = rendered_cloud_config(
+            serde_json::json!({ "issuer": "${secret.EMA_ISSUER}" }),
+            None,
+            &[],
+        );
+        assert!(authorization_server_alignment(&placeholder).is_none());
+
+        let unadvertised = serde_json::json!({
+            "governance": { "access": { "authorization_server": {
+                "issuer": "https://auth.example.com"
+            }}}
+        });
+        assert!(authorization_server_alignment(&unadvertised).is_none());
+    }
+
+    #[test]
+    fn url_origin_normalises_scheme_host_and_default_port() {
+        for (url, origin) in [
+            (
+                "https://edge-1.mcpg.cloud/mcp",
+                Some("https://edge-1.mcpg.cloud"),
+            ),
+            (
+                "HTTPS://EDGE-1.mcpg.cloud:443/",
+                Some("https://edge-1.mcpg.cloud"),
+            ),
+            ("http://localhost:80", Some("http://localhost")),
+            ("http://localhost:8080/x", Some("http://localhost:8080")),
+            ("https://host:4430", Some("https://host:4430")),
+            ("https://u:p@host.example?q=1", Some("https://host.example")),
+            ("https://[::1]:443/mcp", Some("https://[::1]")),
+            (" https://host.example#frag", Some("https://host.example")),
+            ("ftp://host.example", None),
+            ("host.example", None),
+            ("https://", None),
+            ("https://:443", None),
+        ] {
+            assert_eq!(url_origin(url).as_deref(), origin, "{url}");
+        }
     }
 
     // ── Managed-cloud default backend plugins ──────────────────
