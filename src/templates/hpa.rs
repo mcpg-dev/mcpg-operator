@@ -19,7 +19,7 @@ use crate::templates::common::{child_name, owner_ref, standard_labels};
 /// is absent/disabled.
 pub fn build_hpa(parent: &MCPGGateway) -> Option<HorizontalPodAutoscaler> {
     let hpa = parent.spec.autoscaling.as_ref()?;
-    if !hpa.enabled {
+    if !crate::templates::deployment::autoscaled(parent) {
         return None;
     }
 

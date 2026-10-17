@@ -650,6 +650,11 @@ async fn reconcile_inner(
         if canonical.is_some() {
             inject_canonical_url(&mut merged_config, advertised, Some(gateway_tag));
         }
+        inject_events_policy(
+            &mut merged_config,
+            ctx.config.events_egress_probe_url.as_deref(),
+            Some(gateway_tag),
+        );
     }
     // Read from the rendered config, so it judges the identities the gateway
     // will actually advertise. Managed-cloud only: there the edge routes this
@@ -772,7 +777,8 @@ async fn reconcile_inner(
     let updated = dep_status.updated_replicas.unwrap_or(0);
     let available = dep_status.available_replicas.unwrap_or(0);
 
-    let all_replicas_available = available > 0 && available == obj.spec.replicas;
+    let all_replicas_available =
+        available > 0 && available == crate::templates::effective_replicas(&obj);
 
     // Step 5: status update.
     let mut conditions = obj
@@ -808,7 +814,10 @@ async fn reconcile_inner(
                 ctype::READY,
                 "False",
                 reasons::PROGRESSING,
-                format!("{available}/{} replicas available", obj.spec.replicas),
+                format!(
+                    "{available}/{} replicas available",
+                    crate::templates::effective_replicas(&obj)
+                ),
                 Some(observed_generation),
             ),
         );
@@ -910,7 +919,8 @@ async fn reconcile_inner(
             reason: "Reconciled".into(),
             note: Some(format!(
                 "Gateway is Ready ({}/{}) replicas available",
-                available, obj.spec.replicas
+                available,
+                crate::templates::effective_replicas(&obj)
             )),
             action: "Reconcile".into(),
             secondary: None,
@@ -1179,6 +1189,16 @@ fn apply_servers_to_config(
             continue;
         }
         let object_name = server.name_any();
+        // The rendered config is shared by every server this gateway
+        // imports; a block the gateway refuses would stop all of them.
+        if let Some(error) = crate::templates::federate_governance_error(federate) {
+            tracing::warn!(
+                server = %object_name,
+                error = %error,
+                "MCPGServer governance is invalid; its federation is left out of the gateway config"
+            );
+            continue;
+        }
         let fed_name = server.spec.federation_name(&object_name).to_owned();
         let child = crate::templates::server_child_name(server);
         let endpoint = server.spec.endpoint(&child, &server_ns);
@@ -1914,6 +1934,10 @@ const ADDITIONAL_RESOURCES_MIN_GATEWAY: &str = "0.1.0-beta.41";
 /// See [`inject_canonical_url`].
 const CANONICAL_URL_MIN_GATEWAY: &str = "0.1.0-beta.44";
 
+/// First gateway release whose config carries `mcp.configurations.events`.
+/// See [`inject_events_policy`].
+const EVENTS_MIN_GATEWAY: &str = "0.1.0-beta.60";
+
 /// Whether a gateway image `tag` is at or past `min` (semver, prerelease
 /// aware, leading `v` allowed). A rendered config is loaded by whatever
 /// image the pod runs, and the gateway refuses unknown keys, so a key
@@ -2020,6 +2044,59 @@ fn inject_canonical_url(config: &mut serde_json::Value, url: &str, gateway_tag: 
         "canonical_url".to_owned(),
         serde_json::Value::String(url.to_owned()),
     );
+}
+
+/// Pin the MCP Events settings a managed instance runs with: only a verified
+/// principal polls, streams or subscribes a callback, and callbacks are
+/// reached on port 443 alone, the one port the tenant egress policy opens. With
+/// `probe_url`, the gateway also fetches it once delivery starts and reports
+/// whether that egress works. Always overwrites, and only when the config
+/// turns events on.
+///
+/// Written only for a gateway that knows the keys: `EventsConfig` is
+/// `deny_unknown_fields`, and an older image crash-loops on them.
+fn inject_events_policy(
+    config: &mut serde_json::Value,
+    probe_url: Option<&str>,
+    gateway_tag: Option<&str>,
+) {
+    if config.pointer("/mcp/configurations/events/enabled") != Some(&serde_json::Value::Bool(true))
+    {
+        return;
+    }
+    if !gateway_at_least(gateway_tag, EVENTS_MIN_GATEWAY) {
+        warn!(
+            gateway_tag = gateway_tag.unwrap_or("<default>"),
+            minimum = EVENTS_MIN_GATEWAY,
+            "MCP Events policy not stamped: the gateway image predates \
+             mcp.configurations.events and will refuse the config; move the \
+             instance to a newer image"
+        );
+        return;
+    }
+    for mode in ["poll", "push", "webhook"] {
+        let block = ensure_path(config, &["mcp", "configurations", "events", mode]);
+        if !block.is_object() {
+            *block = serde_json::json!({});
+        }
+        block.as_object_mut().expect("just ensured object").insert(
+            "require_trust".to_owned(),
+            serde_json::Value::String("verified".to_owned()),
+        );
+    }
+    let webhook = ensure_path(config, &["mcp", "configurations", "events", "webhook"]);
+    let egress = ensure_path(webhook, &["egress"]);
+    if !egress.is_object() {
+        *egress = serde_json::json!({});
+    }
+    let egress = egress.as_object_mut().expect("just ensured object");
+    egress.insert("allowed_ports".to_owned(), serde_json::json!([443]));
+    if let Some(url) = probe_url.filter(|url| !url.trim().is_empty()) {
+        egress.insert(
+            "probe_url".to_owned(),
+            serde_json::Value::String(url.to_owned()),
+        );
+    }
 }
 
 /// Judge the tenant's `governance.access.authorization_server` against the
@@ -2581,6 +2658,65 @@ mod tests {
         assert!(gateway_at_least(Some("latest"), min));
         assert!(gateway_at_least(Some("sha-abc123"), min));
         assert!(gateway_at_least(None, min));
+    }
+
+    #[test]
+    fn events_policy_is_pinned_only_where_events_run_on_an_image_that_knows_them() {
+        let published = serde_json::json!({
+            "mcp": { "configurations": { "events": {
+                "enabled": true,
+                "webhook": {
+                    "require_trust": "header_asserted",
+                    "egress": { "allowed_ports": [443, 8443], "connect_timeout_ms": 2000 }
+                },
+                "poll": { "require_trust": "header_asserted", "next_poll_ms": 9000 }
+            }}}
+        });
+
+        let probe = Some("https://probe.example/");
+        let mut cfg = published.clone();
+        inject_events_policy(&mut cfg, probe, Some("0.1.0-beta.60"));
+        let events = &cfg["mcp"]["configurations"]["events"];
+        let webhook = &events["webhook"];
+        assert_eq!(webhook["require_trust"], "verified");
+        assert_eq!(webhook["egress"]["allowed_ports"], serde_json::json!([443]));
+        assert_eq!(webhook["egress"]["probe_url"], "https://probe.example/");
+        assert_eq!(webhook["egress"]["connect_timeout_ms"], 2000);
+        assert_eq!(events["poll"]["require_trust"], "verified");
+        assert_eq!(events["poll"]["next_poll_ms"], 9000);
+        assert_eq!(events["push"]["require_trust"], "verified");
+
+        let mut bare = serde_json::json!({
+            "mcp": { "configurations": { "events": { "enabled": true } } }
+        });
+        inject_events_policy(&mut bare, None, None);
+        let events = &bare["mcp"]["configurations"]["events"];
+        assert_eq!(
+            events["webhook"],
+            serde_json::json!({ "require_trust": "verified", "egress": { "allowed_ports": [443] } })
+        );
+        assert_eq!(
+            events["poll"],
+            serde_json::json!({ "require_trust": "verified" })
+        );
+        assert_eq!(
+            events["push"],
+            serde_json::json!({ "require_trust": "verified" })
+        );
+
+        let mut older = published.clone();
+        inject_events_policy(&mut older, probe, Some("0.1.0-beta.59"));
+        assert_eq!(older, published);
+
+        let mut off = published.clone();
+        off["mcp"]["configurations"]["events"]["enabled"] = serde_json::json!(false);
+        let before = off.clone();
+        inject_events_policy(&mut off, probe, Some("0.1.0-beta.60"));
+        assert_eq!(off, before);
+
+        let mut none = serde_json::json!({ "mcp": {} });
+        inject_events_policy(&mut none, probe, Some("0.1.0-beta.60"));
+        assert_eq!(none, serde_json::json!({ "mcp": {} }));
     }
 
     #[test]
@@ -3773,6 +3909,41 @@ mod tests {
         assert_eq!(feds[0]["naming"]["tool_prefix"], "crm_");
         assert_eq!(feds[0]["governance"]["minimum_trust"], "verified");
         assert_eq!(feds[0]["upstream"]["auth"]["mode"], "pass_through");
+    }
+
+    /// One server's governance block that the gateway would refuse leaves
+    /// only that server out: the rendered config still loads, with every
+    /// other server's federation in it.
+    #[test]
+    fn server_fan_in_leaves_out_only_a_server_with_invalid_governance() {
+        let with_governance = |name: &str, governance: serde_json::Value| {
+            let mut server = provisioned_server(name, "team-a", Some("main"), None);
+            if let Some(federate) = server.spec.federate.as_mut() {
+                federate.governance = Some(governance);
+            }
+            server
+        };
+        let servers = vec![
+            with_governance("crm", serde_json::json!({ "minimum_trust": "verified" })),
+            with_governance("typo", serde_json::json!({ "cel_allow_if": "true" })),
+            with_governance("broken", serde_json::json!({ "allow_if": "tool_name == " })),
+            with_governance(
+                "hr",
+                serde_json::json!({ "allow_if": "\"hr\" in identity.groups" }),
+            ),
+        ];
+        let mut config = serde_json::json!({});
+        let n = apply_servers_to_config(&servers, "main", "team-a", &mut config);
+        assert_eq!(n, 2);
+        let names: Vec<_> = federations(&config)
+            .iter()
+            .map(|f| f["name"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(names, ["crm", "hr"]);
+
+        let rendered: mcpg::config::AppConfig =
+            serde_json::from_value(config).expect("the rendered config parses");
+        rendered.validate().expect("the rendered config validates");
     }
 
     // ── clusterRef binding classification (drives the hold) ────

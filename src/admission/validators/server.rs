@@ -9,6 +9,13 @@
 //! - `federate.gatewayRef.name` must be non-empty when `federate` is
 //!   set; the federation name (override or object name) must be a
 //!   config-safe token.
+//! - `federate.governance` must be a block the gateway accepts: known
+//!   keys only, a known trust level, and an `allow_if` that compiles.
+//!   An update that leaves the block as it was is not held to this, so a
+//!   stored server whose block the gateway refuses can still be edited
+//!   and have its finalizer released on delete. The server controller and
+//!   the gateway fan-in check it again, and keep such a server out of the
+//!   gateway.
 //! - a non-digest image WITHOUT `verify` is admitted with a warning
 //!   (moving tags make rollbacks + provenance murky) rather than
 //!   rejected — dev clusters legitimately track tags.
@@ -43,7 +50,7 @@ pub async fn validate(
         return Json(response.into_review());
     };
 
-    let response = match validate_spec(obj) {
+    let response = match validate_spec(obj, req.old_object.as_ref()) {
         Ok(warnings) => {
             let mut r = response;
             if !warnings.is_empty() {
@@ -56,7 +63,8 @@ pub async fn validate(
     Json(response.into_review())
 }
 
-fn validate_spec(obj: &MCPGServer) -> Result<Vec<String>, String> {
+/// `old` is the object an UPDATE replaces; `None` on CREATE.
+fn validate_spec(obj: &MCPGServer, old: Option<&MCPGServer>) -> Result<Vec<String>, String> {
     let spec = &obj.spec;
     let mut warnings = Vec::new();
 
@@ -116,6 +124,18 @@ fn validate_spec(obj: &MCPGServer) -> Result<Vec<String>, String> {
                 return Err(format!("spec.federate.{field} must be a JSON object"));
             }
         }
+        let unchanged = old.is_some_and(|old| {
+            old.spec
+                .federate
+                .as_ref()
+                .is_some_and(|previous| previous.governance == federate.governance)
+        });
+        // A stored block the gateway refuses is kept out of the gateway by the
+        // fan-in; refusing every write that carries it unchanged would refuse
+        // the finalizer release too, and hold the server in Terminating.
+        if !unchanged && let Some(error) = crate::templates::federate_governance_error(federate) {
+            return Err(error);
+        }
     }
 
     Ok(warnings)
@@ -145,7 +165,7 @@ mod tests {
 
     #[test]
     fn tag_image_without_verify_warns_but_admits() {
-        let warnings = validate_spec(&server(minimal())).expect("admitted");
+        let warnings = validate_spec(&server(minimal()), None).expect("admitted");
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("digest-pinned"));
     }
@@ -157,7 +177,7 @@ mod tests {
             "cosignIdentity:\n  oidcIssuer: https://token.actions.githubusercontent.com\n  certificateIdentityRegexp: \"^https://github.com/acme/\"\n",
         )
         .unwrap());
-        let err = validate_spec(&server(spec)).unwrap_err();
+        let err = validate_spec(&server(spec), None).unwrap_err();
         assert!(err.contains("digest-pinned"), "got: {err}");
     }
 
@@ -165,7 +185,7 @@ mod tests {
     fn digest_pin_admits_without_warning() {
         let mut spec = minimal();
         spec.image = format!("ghcr.io/acme/crm@sha256:{}", "a".repeat(64));
-        let warnings = validate_spec(&server(spec)).expect("admitted");
+        let warnings = validate_spec(&server(spec), None).expect("admitted");
         assert!(warnings.is_empty());
     }
 
@@ -176,7 +196,7 @@ mod tests {
             gateway_ref: ServerGatewayRef { name: "  ".into() },
             ..Default::default()
         });
-        let err = validate_spec(&server(spec)).unwrap_err();
+        let err = validate_spec(&server(spec), None).unwrap_err();
         assert!(err.contains("gatewayRef.name"), "got: {err}");
     }
 
@@ -190,14 +210,90 @@ mod tests {
             governance: Some(serde_json::json!("not-an-object")),
             ..Default::default()
         });
-        let err = validate_spec(&server(spec)).unwrap_err();
+        let err = validate_spec(&server(spec), None).unwrap_err();
         assert!(err.contains("governance"), "got: {err}");
+    }
+
+    #[test]
+    fn federate_governance_the_gateway_refuses_is_rejected() {
+        for (governance, needle) in [
+            (
+                serde_json::json!({ "cel_allow_if": "true" }),
+                "cel_allow_if",
+            ),
+            (
+                serde_json::json!({ "minimum_trust": "root" }),
+                "spec.federate.governance",
+            ),
+            (
+                serde_json::json!({ "allow_if": "tool_name == " }),
+                "spec.federate.governance.allow_if",
+            ),
+        ] {
+            let mut spec = minimal();
+            spec.federate = Some(ServerFederate {
+                gateway_ref: ServerGatewayRef {
+                    name: "main".into(),
+                },
+                governance: Some(governance.clone()),
+                ..Default::default()
+            });
+            let err = validate_spec(&server(spec), None).unwrap_err();
+            assert!(err.contains(needle), "{governance}: {err}");
+        }
+
+        let mut spec = minimal();
+        spec.federate = Some(ServerFederate {
+            gateway_ref: ServerGatewayRef {
+                name: "main".into(),
+            },
+            governance: Some(serde_json::json!({
+                "minimum_trust": "verified",
+                "allow_if": "\"crm\" in identity.groups",
+                "required_scopes": ["crm.read"],
+            })),
+            ..Default::default()
+        });
+        validate_spec(&server(spec), None).expect("a valid block is admitted");
+    }
+
+    /// A stored server whose block the gateway refuses can still be written
+    /// with that block unchanged (an edit, or the finalizer release on
+    /// delete); a write that sets or changes the block is held to the check.
+    #[test]
+    fn an_update_that_keeps_an_admitted_governance_block_is_not_refused() {
+        let with_governance = |governance: serde_json::Value| {
+            let mut spec = minimal();
+            spec.federate = Some(ServerFederate {
+                gateway_ref: ServerGatewayRef {
+                    name: "main".into(),
+                },
+                governance: Some(governance),
+                ..Default::default()
+            });
+            server(spec)
+        };
+        let admitted = with_governance(serde_json::json!({ "cel_allow_if": "true" }));
+
+        let mut releasing = admitted.clone();
+        releasing.metadata.finalizers = Some(Vec::new());
+        releasing.spec.image = "ghcr.io/acme/crm:1.0.1".into();
+        validate_spec(&releasing, Some(&admitted)).expect("the unchanged block is not re-judged");
+
+        let changed = with_governance(serde_json::json!({ "allow_if": "tool_name == " }));
+        let err = validate_spec(&changed, Some(&admitted)).unwrap_err();
+        assert!(err.contains("spec.federate.governance.allow_if"), "{err}");
+
+        let mut unfederated = admitted.clone();
+        unfederated.spec.federate = None;
+        let err = validate_spec(&admitted, Some(&unfederated)).unwrap_err();
+        assert!(err.contains("cel_allow_if"), "{err}");
     }
 
     #[test]
     fn invalid_port_rejected() {
         let mut spec = minimal();
         spec.port = Some(0);
-        assert!(validate_spec(&server(spec)).is_err());
+        assert!(validate_spec(&server(spec), None).is_err());
     }
 }

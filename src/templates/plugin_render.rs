@@ -150,9 +150,9 @@ const CLOUD_DEFAULT_BACKEND_PLUGINS: &[(&str, &[&str])] = &[
     ("dev.mcpg.backend.graphql", &["network_outbound"]),
     ("dev.mcpg.backend.openapi", &["network_outbound"]),
     // NOTE: `backend.grpc` is intentionally NOT a cloud default — it is a BUSL
-    // enterprise-system connector (feature `backend.enterprise`), so a community
-    // tenant would be refused it at CP plugin-set bind. Team+ tenants add it
-    // explicitly. Keep this list to free/Apache single-entity plugins only.
+    // enterprise-system connector (feature `backend.enterprise`), which the
+    // gateway withholds from a tenant whose licence lacks it. Team+ tenants add
+    // it explicitly. Keep this list to free/Apache single-entity plugins only.
 ];
 
 /// Resolve the plugin-id list for the managed-cloud defaults.

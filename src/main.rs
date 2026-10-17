@@ -40,8 +40,22 @@ async fn main() -> anyhow::Result<()> {
         watch_namespace = ?cfg.watch_namespace,
         webhook_enabled = cfg.webhook_enabled(),
         offline_trust_root = ?cfg.sigstore_trust_root_path,
+        default_gateway_image = %format!(
+            "{}:{}",
+            mcpg_operator::default_gateway_image_repository(),
+            mcpg_operator::default_gateway_image_tag()
+        ),
         "mcpg-operator starting"
     );
+    if mcpg_operator::default_gateway_image_tag() == mcpg_operator::DEFAULT_GATEWAY_IMAGE_TAG {
+        warn!(
+            env = mcpg_operator::ENV_DEFAULT_GATEWAY_IMAGE_TAG,
+            "no default gateway image tag is configured: an MCPGGateway without \
+             spec.image.tag renders a tag no registry serves; the operator chart \
+             sets the env from the gateway release it was cut with, or from \
+             operator.gatewayImageTag"
+        );
+    }
 
     // Air-gap: point cosign verification at a pre-mirrored Sigstore
     // trust root (no network) when configured. Must run before any

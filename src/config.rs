@@ -174,6 +174,15 @@ pub struct OperatorConfig {
     #[arg(long, env = "MCPG_OPERATOR_DEFAULT_OTLP_TRACES_URL")]
     pub default_otlp_traces_url: Option<String>,
 
+    /// A public `https://` URL on port 443 that CLOUD-provisioned gateways
+    /// which turn MCP Events on fetch when webhook delivery starts, to show
+    /// that the tenant egress policy lets callbacks out
+    /// (`mcp.configurations.events.webhook.egress.probe_url`). Pick one
+    /// outside the platform: an address the cluster short-circuits to a
+    /// private one does not cross the egress rule. Unset = no probe.
+    #[arg(long, env = "MCPG_OPERATOR_EVENTS_EGRESS_PROBE_URL")]
+    pub events_egress_probe_url: Option<String>,
+
     /// Extra pod annotations stamped on every rendered gateway pod, as
     /// comma-separated key=value pairs (e.g.
     /// "prometheus.io/scrape=true,prometheus.io/port=8080"). A CR's own

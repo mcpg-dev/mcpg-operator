@@ -98,6 +98,35 @@ pub struct RevocationListMount {
     pub content_hash: String,
 }
 
+/// The replicas a gateway runs. A managed-cloud gateway runs more than one
+/// only beside the coordinator the platform renders into its config for a
+/// licence that runs them (`clustering`, Enterprise); without that `cluster`
+/// block it runs one, whatever `spec.replicas` says.
+pub fn effective_replicas(parent: &MCPGGateway) -> i32 {
+    if single_replica_cloud(parent) {
+        1
+    } else {
+        parent.spec.replicas
+    }
+}
+
+/// Whether an HPA owns the gateway's replica count.
+pub fn autoscaled(parent: &MCPGGateway) -> bool {
+    parent.spec.autoscaling.as_ref().is_some_and(|a| a.enabled) && !single_replica_cloud(parent)
+}
+
+/// A managed-cloud gateway whose config carries no coordinator.
+fn single_replica_cloud(parent: &MCPGGateway) -> bool {
+    let coordinated = parent
+        .spec
+        .config
+        .get("cluster")
+        .and_then(|c| c.get("kind"))
+        .and_then(|k| k.as_str())
+        .is_some_and(|k| k != "single_node");
+    parent.spec.cloud.is_some() && !coordinated
+}
+
 pub fn build_deployment(
     parent: &MCPGGateway,
     config_hash: &str,
@@ -133,10 +162,10 @@ pub fn build_deployment(
             // When an HPA owns scaling, the Deployment must not pin `replicas`
             // or the operator and the HPA fight every reconcile. Leave it unset
             // so the HPA is the sole authority; otherwise honour `spec.replicas`.
-            replicas: if parent.spec.autoscaling.as_ref().is_some_and(|a| a.enabled) {
+            replicas: if autoscaled(parent) {
                 None
             } else {
-                Some(parent.spec.replicas)
+                Some(effective_replicas(parent))
             },
             selector: LabelSelector {
                 match_labels: Some(selector.clone()),
@@ -811,6 +840,59 @@ mod tests {
             &[],
         );
         assert_eq!(d.spec.unwrap().replicas, Some(5));
+    }
+
+    /// A managed-cloud gateway runs more than one replica only beside the
+    /// coordinator the platform renders for a licence that runs them; without
+    /// it, one, and no HPA takes the count over.
+    #[test]
+    fn a_cloud_gateway_without_the_platform_coordinator_runs_one_replica() {
+        use mcpg_operator_api::v1alpha1::GatewayCloud;
+        use mcpg_operator_api::v1alpha1::gateway::HorizontalAutoscaler;
+        let cloud = |config: serde_json::Value| {
+            fixture(MCPGGatewaySpec {
+                replicas: 3,
+                config,
+                cloud: Some(GatewayCloud {
+                    org_slug: "acme".into(),
+                    instance_slug: "edge".into(),
+                    external_url: "https://edge.mcpg.cloud/mcp".into(),
+                    ..Default::default()
+                }),
+                autoscaling: Some(HorizontalAutoscaler {
+                    enabled: true,
+                    min_replicas: Some(2),
+                    max_replicas: Some(5),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+        let render = |g: &MCPGGateway| {
+            build_deployment(g, "h", &[], None, None, &Default::default(), &[])
+                .spec
+                .unwrap()
+                .replicas
+        };
+        for config in [
+            serde_json::json!({}),
+            serde_json::json!({ "cluster": { "kind": "single_node" } }),
+            serde_json::json!({ "cluster": {} }),
+        ] {
+            let g = cloud(config.clone());
+            assert_eq!(render(&g), Some(1), "{config}");
+            assert_eq!(effective_replicas(&g), 1);
+            assert!(crate::templates::build_hpa(&g).is_none(), "{config}");
+        }
+        let coordinated = cloud(serde_json::json!({ "cluster": { "kind": "nats" } }));
+        assert_eq!(render(&coordinated), None, "the HPA owns the count");
+        assert!(crate::templates::build_hpa(&coordinated).is_some());
+
+        // A self-host gateway is its author's: the count stands.
+        let mut own = cloud(serde_json::json!({}));
+        own.spec.cloud = None;
+        own.spec.autoscaling = None;
+        assert_eq!(render(&own), Some(3));
     }
 
     #[test]

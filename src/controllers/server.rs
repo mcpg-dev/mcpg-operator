@@ -30,7 +30,7 @@ use kube::runtime::events::{Event as K8sEvent, EventType};
 use kube::runtime::watcher;
 use kube::{Resource, ResourceExt};
 use mcpg_operator_api::conditions::{Condition, reasons, types as ctype};
-use mcpg_operator_api::v1alpha1::{MCPGServer, MCPGServerStatus, OciImageRef};
+use mcpg_operator_api::v1alpha1::{MCPGServer, MCPGServerStatus, OciImageRef, ServerFederate};
 use rand::RngExt;
 use tracing::{error, info, instrument};
 
@@ -53,6 +53,7 @@ mod cond_types {
 mod server_reason {
     pub const BOUND: &str = "GatewayBound";
     pub const GATEWAY_NOT_FOUND: &str = "GatewayNotFound";
+    pub const GOVERNANCE_INVALID: &str = "GovernanceInvalid";
     pub const NOT_FEDERATED: &str = "NotFederated";
     pub const VERIFIED: &str = "CosignVerified";
     pub const VERIFY_FAILED: &str = "CosignVerifyFailed";
@@ -278,20 +279,10 @@ async fn reconcile_inner(
         let gw_api: Api<mcpg_operator_api::v1alpha1::MCPGGateway> =
             Api::namespaced(ctx.client.clone(), &ns);
         let exists = gw_api.get_opt(gw_name).await?.is_some();
-        let (bound, reason, msg) = if exists {
+        let (bound, reason, msg) = gateway_bound(federate, &ns, exists);
+        if bound {
             bound_gateway = Some(format!("{ns}/{gw_name}"));
-            (
-                true,
-                server_reason::BOUND,
-                format!("federated into MCPGGateway/{ns}/{gw_name}"),
-            )
-        } else {
-            (
-                false,
-                server_reason::GATEWAY_NOT_FOUND,
-                format!("MCPGGateway/{ns}/{gw_name} not found"),
-            )
-        };
+        }
         set_cond(
             &mut conditions,
             cond_types::GATEWAY_BOUND,
@@ -361,6 +352,37 @@ async fn reconcile_inner(
     Ok((requeue, outcome))
 }
 
+/// The `GatewayBound` condition of a server that asks to be federated into
+/// the same-namespace gateway `federate.gatewayRef` names. A governance
+/// block the gateway would refuse keeps the server out of that gateway's
+/// config (the gateway fan-in skips it), so it is reported here.
+fn gateway_bound(
+    federate: &ServerFederate,
+    ns: &str,
+    gateway_exists: bool,
+) -> (bool, &'static str, String) {
+    let gw_name = &federate.gateway_ref.name;
+    if let Some(error) = crate::templates::federate_governance_error(federate) {
+        (
+            false,
+            server_reason::GOVERNANCE_INVALID,
+            format!("{error}; MCPGGateway/{ns}/{gw_name} does not import this server"),
+        )
+    } else if gateway_exists {
+        (
+            true,
+            server_reason::BOUND,
+            format!("federated into MCPGGateway/{ns}/{gw_name}"),
+        )
+    } else {
+        (
+            false,
+            server_reason::GATEWAY_NOT_FOUND,
+            format!("MCPGGateway/{ns}/{gw_name} not found"),
+        )
+    }
+}
+
 fn set_cond(
     conditions: &mut Vec<Condition>,
     type_: &str,
@@ -399,5 +421,46 @@ fn error_policy(
             Action::await_change()
         }
         _ => Action::requeue(Duration::from_secs(10)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mcpg_operator_api::v1alpha1::ServerGatewayRef;
+
+    fn federate(governance: Option<serde_json::Value>) -> ServerFederate {
+        ServerFederate {
+            gateway_ref: ServerGatewayRef {
+                name: "main".into(),
+            },
+            governance,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn invalid_governance_reports_the_server_unbound() {
+        let (bound, reason, message) = gateway_bound(
+            &federate(Some(serde_json::json!({ "cel_allow_if": "true" }))),
+            "team-a",
+            true,
+        );
+        assert!(!bound);
+        assert_eq!(reason, server_reason::GOVERNANCE_INVALID);
+        assert!(message.contains("cel_allow_if"), "{message}");
+        assert!(message.contains("MCPGGateway/team-a/main"), "{message}");
+
+        let (bound, reason, _) = gateway_bound(
+            &federate(Some(serde_json::json!({ "minimum_trust": "verified" }))),
+            "team-a",
+            true,
+        );
+        assert!(bound);
+        assert_eq!(reason, server_reason::BOUND);
+
+        let (bound, reason, _) = gateway_bound(&federate(None), "team-a", false);
+        assert!(!bound);
+        assert_eq!(reason, server_reason::GATEWAY_NOT_FOUND);
     }
 }

@@ -23,6 +23,15 @@ const GATEWAY_PORT: u16 = 8787;
 /// `PathPrefix`, element-boundary matching): the MCP endpoint and the
 /// gateway's OAuth / AAuth discovery and token paths.
 pub const FORWARDED_PATH_PREFIXES: [&str; 4] = ["/mcp", "/.well-known", "/oauth", "/aauth"];
+/// The signed inbound event route (`POST /webhooks/events/{source_id}`),
+/// forwarded only for an instance whose config serves an inbound event
+/// source. Element-boundary matching keeps the other `/webhooks/*` routes
+/// off the edge.
+pub const INBOUND_EVENTS_PREFIX: &str = "/webhooks/events";
+/// The callbacks of upstream webhook subscriptions
+/// (`POST /webhooks/mcp-events/{federation}/{id}`), forwarded only for an
+/// instance whose config imports event types from a federated server.
+pub const FEDERATED_EVENTS_PREFIX: &str = "/webhooks/mcp-events";
 /// The shared platform edge Gateway the per-instance routes attach to and the
 /// custom-domain listeners are applied onto (`templates::edge`). The edge
 /// itself is provisioned by the `mcpg-cloud-edge` chart; making these
@@ -133,6 +142,11 @@ pub fn build_httproute(parent: &MCPGGateway) -> Option<HTTPRoute> {
             // routes stay off the edge.
             matches: FORWARDED_PATH_PREFIXES
                 .iter()
+                .chain(serves_inbound_events(&parent.spec.config).then_some(&INBOUND_EVENTS_PREFIX))
+                .chain(
+                    imports_federated_events(&parent.spec.config)
+                        .then_some(&FEDERATED_EVENTS_PREFIX),
+                )
                 .map(|prefix| HttpRouteMatch {
                     path: HttpPathMatch {
                         r#type: "PathPrefix".into(),
@@ -152,6 +166,34 @@ pub fn build_httproute(parent: &MCPGGateway) -> Option<HTTPRoute> {
     route.metadata.labels = Some(standard_labels(parent));
     route.metadata.owner_references = Some(vec![owner_ref(parent)]);
     Some(route)
+}
+
+/// Whether the config serves MCP Events with at least one `inbound` event
+/// source, the only events surface a caller outside the platform reaches.
+pub fn serves_inbound_events(config: &serde_json::Value) -> bool {
+    config.pointer("/mcp/configurations/events/enabled") == Some(&serde_json::Value::Bool(true))
+        && config
+            .pointer("/mcp/capabilities/events")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|types| {
+                types
+                    .iter()
+                    .any(|ty| ty.pointer("/source/inbound").is_some_and(|v| v.is_object()))
+            })
+}
+
+/// Whether the config serves MCP Events with a federation that imports
+/// event types: their upstreams may deliver to its callbacks.
+pub fn imports_federated_events(config: &serde_json::Value) -> bool {
+    config.pointer("/mcp/configurations/events/enabled") == Some(&serde_json::Value::Bool(true))
+        && config
+            .pointer("/mcp/federations")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|federations| {
+                federations.iter().any(|federation| {
+                    federation.pointer("/import/events") == Some(&serde_json::Value::Bool(true))
+                })
+            })
 }
 
 /// Extract the bare host from `https://host/path` (or `http://`).
@@ -212,5 +254,91 @@ mod tests {
         assert_eq!(rule.backend_refs[0].name, "edge-1");
         assert_eq!(rule.backend_refs[0].port, 8787);
         assert_eq!(route.spec.parent_refs[0].name, "mcpg-cloud-gateway");
+    }
+
+    fn prefixes_for(config: serde_json::Value) -> Vec<String> {
+        let mut gw = gw_with_cloud(Some(GatewayCloud {
+            org_slug: "acme".into(),
+            instance_slug: "edge-1".into(),
+            external_url: "https://edge-1.mcpg.cloud/mcp".into(),
+            ..Default::default()
+        }));
+        gw.spec.config = config;
+        let route = build_httproute(&gw).unwrap();
+        route.spec.rules[0]
+            .matches
+            .iter()
+            .map(|m| m.path.value.clone())
+            .collect()
+    }
+
+    #[test]
+    fn inbound_event_sources_open_their_route_and_nothing_else_does() {
+        let inbound = serde_json::json!({
+            "mcp": {
+                "configurations": { "events": { "enabled": true } },
+                "capabilities": { "events": [
+                    { "name": "orders.created", "source": { "watch": { "resource": "orders" } } },
+                    { "name": "gh.issue", "source": { "inbound": { "source_id": "gh" } } }
+                ]}
+            }
+        });
+        assert_eq!(
+            prefixes_for(inbound.clone()),
+            vec![
+                "/mcp",
+                "/.well-known",
+                "/oauth",
+                "/aauth",
+                "/webhooks/events"
+            ]
+        );
+
+        let mut disabled = inbound.clone();
+        disabled["mcp"]["configurations"]["events"]["enabled"] = serde_json::json!(false);
+        assert_eq!(prefixes_for(disabled).len(), FORWARDED_PATH_PREFIXES.len());
+
+        let mut watch_only = inbound;
+        watch_only["mcp"]["capabilities"]["events"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(1);
+        assert_eq!(
+            prefixes_for(watch_only).len(),
+            FORWARDED_PATH_PREFIXES.len()
+        );
+
+        assert_eq!(
+            prefixes_for(serde_json::json!({})).len(),
+            FORWARDED_PATH_PREFIXES.len()
+        );
+    }
+
+    #[test]
+    fn a_federation_that_imports_events_opens_the_upstream_callbacks() {
+        let importing = serde_json::json!({
+            "mcp": {
+                "configurations": { "events": { "enabled": true } },
+                "federations": [
+                    { "name": "docs", "import": { "tools": true } },
+                    { "name": "gh", "import": { "tools": true, "events": true } }
+                ]
+            }
+        });
+        assert_eq!(
+            prefixes_for(importing.clone()).last().map(String::as_str),
+            Some("/webhooks/mcp-events")
+        );
+
+        let mut tools_only = importing.clone();
+        tools_only["mcp"]["federations"][1]["import"]["events"] = serde_json::json!(false);
+        assert_eq!(
+            prefixes_for(tools_only).len(),
+            FORWARDED_PATH_PREFIXES.len()
+        );
+
+        let mut disabled = importing;
+        disabled["mcp"]["configurations"]["events"]["enabled"] = serde_json::json!(false);
+        assert_eq!(prefixes_for(disabled).len(), FORWARDED_PATH_PREFIXES.len());
     }
 }

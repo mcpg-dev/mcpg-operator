@@ -24,7 +24,9 @@ mod service_account;
 
 pub use common::{child_name, owner_ref, selector_labels, standard_labels};
 pub use configmap::build_configmap;
-pub use deployment::{PLUGIN_CACHE_DIR, PluginSecretMount, RevocationListMount, build_deployment};
+pub use deployment::{
+    PLUGIN_CACHE_DIR, PluginSecretMount, RevocationListMount, build_deployment, effective_replicas,
+};
 pub use hpa::build_hpa;
 pub use httproute::{HTTPRoute, build_httproute};
 pub use managed_nats::{
@@ -37,6 +39,8 @@ pub use plugin_render::{
     append_cloud_default_plugins, append_cluster_coordinator_plugin,
     append_observability_sink_plugins, cloud_default_plugin_ids, merge_plugins,
 };
-pub use server::{build_server_deployment, build_server_service, server_child_name};
+pub use server::{
+    build_server_deployment, build_server_service, federate_governance_error, server_child_name,
+};
 pub use service::build_service;
 pub use service_account::build_service_account;

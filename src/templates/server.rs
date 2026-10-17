@@ -15,9 +15,22 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReferen
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::Resource;
 use kube::core::ObjectMeta;
-use mcpg_operator_api::v1alpha1::MCPGServer;
+use mcpg_expr::governance::BackendGovernanceConfig;
+use mcpg_operator_api::v1alpha1::{MCPGServer, ServerFederate};
 
 use crate::labels;
+
+/// Why a gateway would refuse `federate.governance`, or `None` when the
+/// block is absent or valid. The operator writes the block verbatim into a
+/// gateway config that may serve other tenants too, and a block the gateway
+/// refuses stops that whole config from loading, so it is checked with the
+/// gateway's own type and validation first.
+pub fn federate_governance_error(federate: &ServerFederate) -> Option<String> {
+    let governance = federate.governance.as_ref()?;
+    BackendGovernanceConfig::from_value(governance, "spec.federate")
+        .err()
+        .map(|error| format!("{error:#}"))
+}
 
 /// Owner reference pointing back to the parent `MCPGServer`, so K8s GC
 /// propagates deletion to the rendered Deployment/Service.

@@ -65,18 +65,16 @@ pub const DEFAULT_GATEWAY_IMAGE_REPOSITORY: &str = "ghcr.io/mcpg-dev/mcpg";
 /// release artifact.
 pub const ENV_DEFAULT_GATEWAY_IMAGE_REPOSITORY: &str = "MCPG_DEFAULT_GATEWAY_IMAGE_REPOSITORY";
 
-/// Compile-time pin for the default gateway image tag. The release
-/// pipeline overrides this via `RUSTFLAGS` so each operator build
-/// ships pinned to a known-good gateway version. Call
+/// Placeholder default gateway image tag, used when a `MCPGGateway` omits
+/// `spec.image.tag` and [`ENV_DEFAULT_GATEWAY_IMAGE_TAG`] is unset. No
+/// registry serves it: the operator binary cannot know which gateway
+/// release it runs beside, so the real default arrives at runtime. Call
 /// [`default_gateway_image_tag`] rather than reading this directly.
-pub const DEFAULT_GATEWAY_IMAGE_TAG: &str = match option_env!("MCPG_OPERATOR_DEFAULT_GATEWAY_TAG") {
-    Some(t) => t,
-    None => "v1.0.0-dev",
-};
+pub const DEFAULT_GATEWAY_IMAGE_TAG: &str = "v1.0.0-dev";
 
-/// Runtime override for the default gateway image tag. Layered ON TOP of
-/// the [`DEFAULT_GATEWAY_IMAGE_TAG`] build pin, which stays the value a
-/// release artifact ships with when this is unset.
+/// Runtime default gateway image tag. The operator chart sets it from the
+/// gateway release the chart was cut with (its `mcpg.dev/gateway-version`
+/// annotation) or from `operator.gatewayImageTag`.
 pub const ENV_DEFAULT_GATEWAY_IMAGE_TAG: &str = "MCPG_DEFAULT_GATEWAY_IMAGE_TAG";
 
 /// Compile-time default for the plugin version managed-cloud gateways load.
@@ -95,8 +93,7 @@ pub const ENV_DEFAULT_GATEWAY_IMAGE_TAG: &str = "MCPG_DEFAULT_GATEWAY_IMAGE_TAG"
 /// resolves to — and CD re-points that tag at every plugin publish. The
 /// release pipeline is where that act belongs: setting
 /// `MCPG_OPERATOR_DEFAULT_PLUGIN_VERSION` at build time pins an operator to
-/// the plugin versions it is released beside, the same `option_env!` build
-/// pin [`DEFAULT_GATEWAY_IMAGE_TAG`] carries. No release job sets it today,
+/// the plugin versions it is released beside. No release job sets it today,
 /// so a released operator renders the floating tag above.
 ///
 /// It is a VERSION, not a digest, deliberately. Plugin artefacts are
@@ -145,7 +142,7 @@ pub fn default_gateway_image_repository() -> &'static str {
 }
 
 /// Effective default gateway image tag: [`ENV_DEFAULT_GATEWAY_IMAGE_TAG`]
-/// when set non-blank, else the [`DEFAULT_GATEWAY_IMAGE_TAG`] build pin.
+/// when set non-blank, else the [`DEFAULT_GATEWAY_IMAGE_TAG`] placeholder.
 pub fn default_gateway_image_tag() -> &'static str {
     RESOLVED_GATEWAY_IMAGE_TAG
         .get_or_init(|| {
