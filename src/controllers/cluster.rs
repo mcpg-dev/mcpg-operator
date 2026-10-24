@@ -442,7 +442,13 @@ async fn reconcile_managed(
     let cm = build_nats_configmap(obj, ns, tls_enabled);
     let headless = build_nats_headless_service(obj, ns);
     let client = build_nats_client_service(obj, ns);
-    let statefulset = build_nats_statefulset(obj, ns, replicas, tls_enabled);
+    let mut statefulset = build_nats_statefulset(obj, ns, replicas, tls_enabled);
+    if let Some(spec) = statefulset.spec.as_mut() {
+        crate::templates::apply_pod_dns_config(
+            &mut spec.template,
+            ctx.config.pod_dns_config.as_ref(),
+        );
+    }
     let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), ns);
     let svc_api: Api<Service> = Api::namespaced(ctx.client.clone(), ns);
     let ss_api: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), ns);

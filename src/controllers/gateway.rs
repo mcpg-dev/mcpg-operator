@@ -692,7 +692,7 @@ async fn reconcile_inner(
     let (cm, config_hash) = build_configmap(&obj, &merged_config);
     let svc = build_service(&obj);
     let sa = build_service_account(&obj);
-    let dep = build_deployment(
+    let mut dep = build_deployment(
         &obj,
         &config_hash,
         plugin_set
@@ -704,6 +704,12 @@ async fn reconcile_inner(
         &ctx.config.gateway_pod_annotations_map(),
         &extra_env_from,
     );
+    if let Some(spec) = dep.spec.as_mut() {
+        crate::templates::apply_pod_dns_config(
+            &mut spec.template,
+            ctx.config.pod_dns_config.as_ref(),
+        );
+    }
 
     // Step 3: SSA each child.
     let cm_api: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), &ns);

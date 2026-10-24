@@ -77,6 +77,17 @@ pub fn child_name(parent: &MCPGGateway, suffix: &str) -> String {
     }
 }
 
+/// Put the operator-wide pod DNS settings (`MCPG_OPERATOR_POD_DNS_CONFIG`)
+/// on a pod template the operator renders. `None` leaves the cluster's.
+pub fn apply_pod_dns_config(
+    template: &mut k8s_openapi::api::core::v1::PodTemplateSpec,
+    dns: Option<&k8s_openapi::api::core::v1::PodDNSConfig>,
+) {
+    if let (Some(dns), Some(spec)) = (dns, template.spec.as_mut()) {
+        spec.dns_config = Some(dns.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +105,39 @@ mod tests {
             spec: MCPGGatewaySpec::default(),
             status: None,
         }
+    }
+
+    #[test]
+    fn the_pod_dns_config_lands_on_the_gateway_pod_and_none_leaves_it_unset() {
+        use k8s_openapi::api::core::v1::{PodDNSConfig, PodDNSConfigOption};
+        let render = || {
+            crate::templates::build_deployment(
+                &fixture(),
+                "hash",
+                &[],
+                None,
+                None,
+                &BTreeMap::new(),
+                &[],
+            )
+        };
+        let dns = PodDNSConfig {
+            options: Some(vec![PodDNSConfigOption {
+                name: Some("ndots".to_owned()),
+                value: Some("2".to_owned()),
+            }]),
+            ..Default::default()
+        };
+
+        let mut dep = render();
+        let template = &mut dep.spec.as_mut().unwrap().template;
+        apply_pod_dns_config(template, Some(&dns));
+        assert_eq!(template.spec.as_ref().unwrap().dns_config, Some(dns));
+
+        let mut dep = render();
+        let template = &mut dep.spec.as_mut().unwrap().template;
+        apply_pod_dns_config(template, None);
+        assert_eq!(template.spec.as_ref().unwrap().dns_config, None);
     }
 
     #[test]

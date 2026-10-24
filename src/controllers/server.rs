@@ -228,7 +228,13 @@ async fn reconcile_inner(
     let fm = format!("{FIELD_MANAGER_PREFIX}/{FIELD_MANAGER_SUFFIX}");
     let deploy_api: Api<Deployment> = Api::namespaced(ctx.client.clone(), &ns);
     if verified {
-        let deployment = build_server_deployment(obj.as_ref());
+        let mut deployment = build_server_deployment(obj.as_ref());
+        if let Some(spec) = deployment.spec.as_mut() {
+            crate::templates::apply_pod_dns_config(
+                &mut spec.template,
+                ctx.config.pod_dns_config.as_ref(),
+            );
+        }
         apply_owned(&deploy_api, &deployment, &fm).await?;
         let service = build_server_service(obj.as_ref());
         let svc_api: Api<Service> = Api::namespaced(ctx.client.clone(), &ns);

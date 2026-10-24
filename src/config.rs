@@ -191,6 +191,16 @@ pub struct OperatorConfig {
     #[arg(long, env = "MCPG_OPERATOR_GATEWAY_POD_ANNOTATIONS")]
     pub gateway_pod_annotations: Option<String>,
 
+    /// Pod DNS settings put on every pod the operator renders (gateway,
+    /// MCPGServer and managed NATS pods), as the JSON of a core/v1
+    /// PodDNSConfig, e.g. `{"options":[{"name":"ndots","value":"1"}]}`. A
+    /// node resolver with a search domain otherwise resolves every name with
+    /// fewer dots than `ndots` (default 5) through that domain first. Unset
+    /// leaves the cluster's DNS settings; a value that is not a PodDNSConfig
+    /// stops the operator at start.
+    #[arg(long, env = "MCPG_OPERATOR_POD_DNS_CONFIG", value_parser = parse_pod_dns_config)]
+    pub pod_dns_config: Option<k8s_openapi::api::core::v1::PodDNSConfig>,
+
     /// Run this operator as a PULL-MODE cell agent in addition to its normal
     /// controllers.
     ///
@@ -230,6 +240,10 @@ pub struct OperatorConfig {
     /// nothing outside it can reach its apiserver.
     #[arg(long, env = "MCPG_OPERATOR_FLEET_HEARTBEAT_SECS", default_value_t = 30)]
     pub fleet_heartbeat_secs: u64,
+}
+
+fn parse_pod_dns_config(raw: &str) -> Result<k8s_openapi::api::core::v1::PodDNSConfig, String> {
+    serde_json::from_str(raw).map_err(|e| format!("not a core/v1 PodDNSConfig in JSON: {e}"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -292,6 +306,25 @@ mod tests {
             Some("8080")
         );
         assert_eq!(map.len(), 2, "malformed pairs are skipped: {map:?}");
+    }
+
+    #[test]
+    fn pod_dns_config_parses_and_refuses_what_is_not_one() {
+        let cfg = OperatorConfig::try_parse_from([
+            "mcpg-operator",
+            r#"--pod-dns-config={"options":[{"name":"ndots","value":"2"}]}"#,
+        ])
+        .unwrap();
+        let dns = cfg.pod_dns_config.expect("parsed");
+        let options = dns.options.expect("options");
+        assert_eq!(options[0].name.as_deref(), Some("ndots"));
+        assert_eq!(options[0].value.as_deref(), Some("2"));
+
+        let none = OperatorConfig::try_parse_from(["mcpg-operator"]).unwrap();
+        assert!(none.pod_dns_config.is_none());
+
+        let bad = OperatorConfig::try_parse_from(["mcpg-operator", "--pod-dns-config=ndots:2"]);
+        assert!(bad.is_err());
     }
 
     #[test]

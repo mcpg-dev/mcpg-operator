@@ -22,7 +22,7 @@ mod server;
 mod service;
 mod service_account;
 
-pub use common::{child_name, owner_ref, selector_labels, standard_labels};
+pub use common::{apply_pod_dns_config, child_name, owner_ref, selector_labels, standard_labels};
 pub use configmap::build_configmap;
 pub use deployment::{
     PLUGIN_CACHE_DIR, PluginSecretMount, RevocationListMount, build_deployment, effective_replicas,
