@@ -1,7 +1,7 @@
 [package]
 name = "mcpg-operator"
 description = "Kubernetes operator for managing MCPG (Model Context Protocol Gateway) deployments"
-version = "0.1.0-beta.69"
+version = "0.1.0-beta.70"
 edition = "2024"
 license = "BUSL-1.1"
 repository = "https://github.com/mcpg-dev/mcpg-operator"
@@ -35,8 +35,8 @@ mcpg-operator-api = { git = "https://github.com/mcpg-dev/mcpg-operator-api", tag
 # gateway's exact verification path so admission-time + load-
 # time checks are byte-equivalent (no shim layer to drift).
 # Default features only — no `wasm` feature pulls wasmtime in.
-mcpg-plugin-host = { git = "https://github.com/mcpg-dev/mcpg-plugin-host", tag = "v0.1.0-beta.46", version = "=0.1.0-beta.46" }
-mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.44", version = "=0.1.0-beta.44" }
+mcpg-plugin-host = { git = "https://github.com/mcpg-dev/mcpg-plugin-host", tag = "v0.1.0-beta.47", version = "=0.1.0-beta.47" }
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.45", version = "=0.1.0-beta.45" }
 
 # The gateway's `governance` block type and its validation, so an
 # MCPGServer's block is checked exactly as the gateway will read it
@@ -149,7 +149,7 @@ base64 = "0.23"
 # drift like the `plugins` object→array flatten fails in operator CI
 # instead of at a customer's gateway boot. NOT a runtime dependency;
 # the operator binary never links the gateway.
-mcpg = { git = "https://github.com/mcpg-dev/mcpg", tag = "v0.1.0-beta.71", version = "=0.1.0-beta.71" }
+mcpg = { git = "https://github.com/mcpg-dev/mcpg", tag = "v0.1.0-beta.72", version = "=0.1.0-beta.72" }
 
 [lints.rust]
 # The `fleet` cfg stays declared even where the feature itself is absent:
