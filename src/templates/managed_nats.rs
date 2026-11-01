@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(req.0, "10Gi");
         let pod = spec.template.spec.as_ref().unwrap();
         let container = &pod.containers[0];
-        assert_eq!(container.image.as_deref(), Some("nats:2.10.25-alpine"));
+        assert_eq!(container.image.as_deref(), Some("nats:2.14.8-alpine"));
         // Token wired from the coordination Secret.
         let token_env = container
             .env
