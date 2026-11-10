@@ -68,6 +68,16 @@ jobs:
           sudo apt-get install -y -qq protobuf-compiler libkrb5-dev \
             || { sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler libkrb5-dev; }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      # A crate with a Go part (a C archive its build.rs builds) needs the Go
+      # toolchain its go.mod names.
+      - name: Go part of the crate
+        id: go
+        run: echo "mod=$(git ls-files '*go.mod' | head -1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        if: steps.go.outputs.mod != ''
+        with:
+          go-version-file: ${{ steps.go.outputs.mod }}
+          cache: false
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
