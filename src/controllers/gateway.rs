@@ -1241,7 +1241,6 @@ fn apply_servers_to_config(
                 "allow_private_backends": true,
                 "allow_insecure_http": true,
             },
-            "protocol_version": "auto",
         });
         if let Some(auth) = federate.auth.as_ref() {
             upstream["auth"] = auth.clone();
@@ -3848,7 +3847,14 @@ mod tests {
             feds[0]["upstream"]["url"],
             "http://crm.team-a.svc.cluster.local:8080/mcp"
         );
-        assert_eq!(feds[0]["upstream"]["protocol_version"], "auto");
+        let mut upstream_keys: Vec<&str> = feds[0]["upstream"]
+            .as_object()
+            .expect("upstream")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        upstream_keys.sort_unstable();
+        assert_eq!(upstream_keys, ["upstream_safety", "url"]);
         assert_eq!(
             feds[0]["upstream"]["upstream_safety"]["allow_private_backends"],
             true
